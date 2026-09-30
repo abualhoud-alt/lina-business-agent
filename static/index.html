@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lina — MBS Command Center</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:Inter,Arial,sans-serif;background:#f4f7fb;color:#162033}
+.app{display:flex;min-height:100vh}.side{width:245px;background:#102b4e;color:#fff;padding:24px 16px;position:fixed;inset:0 auto 0 0}.brand{font-size:23px;font-weight:800;margin:0 8px 5px}.sub{font-size:11px;color:#a9c0dc;margin:0 8px 25px}.nav button{width:100%;border:0;background:transparent;color:#dce8f7;text-align:left;padding:12px 13px;border-radius:9px;margin:3px 0;cursor:pointer}.nav button.active,.nav button:hover{background:#1d4775;color:#fff}.main{margin-left:245px;width:calc(100% - 245px);padding:26px;max-width:1500px}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:22px}.top h1{margin:0;font-size:28px}.pill{background:#e8f1fb;padding:8px 12px;border-radius:20px;font-size:12px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:15px}.card{background:#fff;border:1px solid #e4eaf1;border-radius:14px;padding:18px;box-shadow:0 2px 8px #102b4e0b}.kpi{font-size:12px;color:#718096}.num{font-size:27px;font-weight:800;margin-top:7px}.section{margin-top:20px}.section h2{font-size:17px;margin:0 0 12px}.two{display:grid;grid-template-columns:1.5fr 1fr;gap:18px}.table{width:100%;border-collapse:collapse}.table th,.table td{padding:11px 9px;border-bottom:1px solid #edf1f5;text-align:left;font-size:13px}.table th{color:#66758a;font-size:11px;text-transform:uppercase}.tag{display:inline-block;padding:4px 8px;border-radius:12px;font-size:11px;font-weight:700}.hot{background:#ffe4e4;color:#a11}.warm{background:#fff0cf;color:#8a5b00}.dev{background:#e5f1ff;color:#1762a6}.ok{background:#e5f7ed;color:#137344}.actions{display:flex;gap:9px;flex-wrap:wrap}.btn{border:0;border-radius:9px;padding:10px 13px;background:#123e69;color:white;cursor:pointer}.btn.alt{background:#edf3f9;color:#17324e}.btn.green{background:#198754}.form{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.form label{font-size:12px;color:#637186}.form input,.form select,.form textarea{width:100%;margin-top:5px;padding:10px;border:1px solid #d7e0ea;border-radius:8px;background:white}.form textarea{min-height:90px}.full{grid-column:1/-1}.hidden{display:none}.notice{padding:13px;border-left:4px solid #1b6ca8;background:#eef6fd;border-radius:8px;font-size:13px}.chat{height:330px;display:flex;flex-direction:column}.msgs{flex:1;overflow:auto;padding:8px}.msg{max-width:82%;padding:10px 12px;border-radius:11px;margin:7px 0;font-size:13px}.lina{background:#edf5fc}.user{background:#dff2e8;margin-left:auto}.chatbar{display:flex;gap:8px}.chatbar input{flex:1;padding:11px;border:1px solid #d7e0ea;border-radius:9px}
+@media(max-width:900px){.side{width:190px}.main{margin-left:190px;width:calc(100% - 190px)}.grid{grid-template-columns:repeat(2,1fr)}.two{grid-template-columns:1fr}}
+@media(max-width:620px){.side{position:static;width:100%;height:auto}.app{display:block}.main{margin:0;width:100%;padding:15px}.grid{grid-template-columns:1fr}.form{grid-template-columns:1fr}.top{align-items:flex-start;gap:10px;flex-direction:column}}
+</style>
+</head>
+<body>
+<div class="app">
+<aside class="side">
+  <div class="brand">LINA</div><div class="sub">MBS Business & Sales Manager</div>
+  <div class="nav">
+    <button class="active" onclick="show('dashboard',this)">⌂ Dashboard</button>
+    <button onclick="show('crm',this)">▣ CRM</button>
+    <button onclick="show('leads',this)">◎ Lead Hunter</button>
+    <button onclick="show('quotes',this)">▤ Quotations</button>
+    <button onclick="show('follow',this)">◷ Follow-ups</button>
+    <button onclick="show('reports',this)">◈ Reports</button>
+    <button onclick="show('lina',this)">✦ Ask Lina</button>
+    <button onclick="show('settings',this)">⚙ Company Settings</button>
+  </div>
+</aside>
+<main class="main"><div id="authBar" class="card" style="margin-bottom:15px"><b>Secure connection</b> — Enter your Lina API key to connect this interface to the production database.<div class="chatbar" style="margin-top:8px"><input id="apiKey" type="password" placeholder="Lina API key"><button class="btn" onclick="connectLina()">Connect</button><span id="authStatus" class="kpi" style="padding:10px"></span></div></div>
+<section id="dashboard">
+<div class="top"><div><h1>Good evening, Khodor</h1><div class="kpi">Lina Command Center · Matrix Business Services</div></div><span class="pill">Approval mode: ON</span></div>
+<div class="grid">
+<div class="card"><div class="kpi">HOT Opportunities</div><div class="num" id="hotKpi">0</div></div>
+<div class="card"><div class="kpi">Pipeline Value</div><div class="num" id="pipelineKpi">OMR 0</div></div>
+<div class="card"><div class="kpi">Quotes Awaiting Approval</div><div class="num" id="quoteKpi">0</div></div>
+<div class="card"><div class="kpi">Overdue Follow-ups</div><div class="num" id="overdueKpi">0</div></div>
+</div>
+<div class="section two">
+<div class="card"><h2>Priority Opportunities</h2><table class="table"><tr><th>Opportunity</th><th>Stage</th><th>Score</th><th>Next Action</th></tr>
+<tbody id="priorityRows"><tr><td colspan="4">Loading real MBS data…</td></tr></tbody></table></div>
+<div class="card"><h2>Approval Center</h2><div class="notice"><b>3 quotations</b> are ready for your review. Lina will not send or commit any commercial offer without your approval.</div><br><div class="actions"><button class="btn" onclick="show('quotes')">Review Quotes</button><button class="btn alt" onclick="show('follow')">View Follow-ups</button></div></div>
+</div>
+</section>
+
+<section id="crm" class="hidden">
+<div class="top"><div><h1>CRM</h1><div class="kpi">Companies · Contacts · Opportunities · Activities</div></div><button class="btn" onclick="alert('New CRM record form ready for integration with a cloud database.')">+ New Record</button></div>
+<div class="card"><table class="table"><tr><th>Company</th><th>Contact</th><th>Industry</th><th>Opportunity</th><th>Priority</th></tr>
+<tr><td>University / Education Account</td><td>Procurement Manager</td><td>Education</td><td>Interactive Displays</td><td><span class="tag hot">HOT</span></td></tr>
+<tr><td>Government Entity</td><td>IT / Procurement</td><td>Government</td><td>Digital Archiving</td><td><span class="tag hot">HOT</span></td></tr>
+<tr><td>Hospital Group</td><td>Operations Manager</td><td>Healthcare</td><td>Queue Management Systems</td><td><span class="tag warm">WARM</span></td></tr></table></div>
+</section>
+
+<section id="leads" class="hidden">
+<div class="top"><div><h1>Lead Hunter</h1><div class="kpi">Research → Qualify → Score → Recommend</div></div></div>
+<div class="card"><div class="form">
+<label>Target country<input id="country" placeholder="e.g. Oman, UAE, Saudi Arabia"></label>
+<label>Industry<select id="industry"><option>Government</option><option>Education</option><option>Healthcare</option><option>Banking</option><option>Hospitality</option><option>Corporate</option></select></label>
+<label class="full">Solution<input id="solution" placeholder="e.g. Interactive Displays, Digital Archiving, MFP, Website Development"></label>
+<label class="full">Research objective<textarea id="objective" placeholder="Describe the project or market you want Lina to investigate"></textarea></label>
+</div><br><button class="btn" onclick="createLead()">Create Research Task</button><div id="leadResult"></div></div>
+</section>
+
+<section id="quotes" class="hidden">
+<div class="top"><div><h1>Quotation Manager</h1><div class="kpi">Draft → Margin Check → Your Approval → Customer</div></div></div>
+<div class="card"><div class="notice"><b>Financial control:</b> Lina may prepare calculations and recommendations, but pricing, discount, margin, payment, delivery and warranty commitments require Khodor's approval.</div><br>
+<div class="form">
+<label>Customer<input placeholder="Customer name"></label><label>Quotation No.<input placeholder="Auto-generated in production"></label>
+<label>Solution<input placeholder="Solution / product"></label><label>Quantity<input type="number" value="1"></label>
+<label>Cost per unit (OMR)<input id="cost" type="number" value="0"></label><label>Selling price per unit (OMR)<input id="sell" type="number" value="0"></label>
+<label>VAT %<input id="vat" type="number" value="5"></label><label>Validity (days)<input type="number" value="30"></label>
+<label>Payment Terms<input placeholder="Subject to approval"></label><label>Delivery / Warranty<input placeholder="Subject to approval"></label>
+</div><br><button class="btn" onclick="margin()">Calculate Margin</button> <button class="btn green" onclick="alert('Quote marked READY FOR KHODOR APPROVAL. No customer submission performed.')">Request Approval</button><div id="marginResult"></div></div>
+</section>
+
+<section id="follow" class="hidden">
+<div class="top"><div><h1>Follow-ups</h1><div class="kpi">Never miss the next action</div></div><button class="btn" onclick="alert('Task creation will connect to the production calendar/CRM.')">+ Add Follow-up</button></div>
+<div class="card"><table class="table"><tr><th>Account</th><th>Action</th><th>Due</th><th>Status</th></tr>
+<tr><td>University Account</td><td>Follow up quotation</td><td>Today</td><td><span class="tag hot">URGENT</span></td></tr>
+<tr><td>Government Prospect</td><td>Confirm requirements</td><td>Tomorrow</td><td><span class="tag warm">PENDING</span></td></tr>
+<tr><td>Hospital Group</td><td>Meeting request</td><td>18 Sep</td><td><span class="tag dev">OPEN</span></td></tr></table></div>
+</section>
+
+<section id="reports" class="hidden">
+<div class="top"><div><h1>Management Reports</h1><div class="kpi">Executive view of sales performance</div></div></div>
+<div class="grid"><div class="card"><div class="kpi">New Leads This Month</div><div class="num" id="reportLeads">0</div></div><div class="card"><div class="kpi">Qualified Opportunities</div><div class="num" id="reportOpps">0</div></div><div class="card"><div class="kpi">Quotes Issued</div><div class="num" id="reportQuotes">0</div></div><div class="card"><div class="kpi">Won Deals</div><div class="num" id="reportWon">0</div></div></div>
+<div class="section card"><h2>Executive Summary</h2><p>Lina should highlight pipeline growth, HOT opportunities, quotation conversion, overdue actions, expected revenue, margin risk and deals requiring management attention.</p></div>
+</section>
+
+<section id="lina" class="hidden">
+<div class="top"><div><h1>Ask Lina</h1><div class="kpi">Your natural-language business command center</div></div></div>
+<div class="card chat"><div class="msgs" id="msgs"><div class="msg lina"><b>Lina:</b> Hello Khodor. Tell me what you need — leads, customer research, follow-ups, quotations, reports, or market opportunities.</div></div><div class="chatbar"><input id="chatInput" placeholder="e.g. Show me today's HOT opportunities" onkeydown="if(event.key==='Enter')askLina()"><button class="btn" onclick="askLina()">Send</button></div></div>
+</section>
+
+<section id="settings" class="hidden">
+<div class="top"><div><h1>Company Settings</h1><div class="kpi">Configurable identity — designed for future multi-company use</div></div></div>
+<div class="card"><div class="form"><label>Company Name<input value="Matrix Business Services"></label><label>Country<input value="Oman"></label><label>Website<input value="https://mbs-om.com"></label><label>Sales Email<input value="sales@mbs-om.com"></label><label>Info Email<input value="Info@mbs-om.com"></label><label>Currency<input value="OMR"></label></div><br><div class="notice">Important: company phone information in the existing materials is inconsistent. Production configuration should be confirmed before publishing official documents.</div></div>
+</section>
+</main></div>
+<script>
+let API_KEY = localStorage.getItem("lina_api_key") || "";
+function esc(x){return String(x??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","\'":"&#39;"}[m]||m))}
+async function api(path, options={}){options.headers={...(options.headers||{}),"X-API-Key":API_KEY,"Content-Type":"application/json"};let r=await fetch(path,options);if(!r.ok) throw new Error(await r.text());return r.json()}
+function connectLina(){let k=document.getElementById("apiKey").value.trim();if(!k)return;API_KEY=k;localStorage.setItem("lina_api_key",k);loadLiveData()}
+async function loadLiveData(){try{let d=await api("/dashboard");document.getElementById("hotKpi").textContent=d.hot_opportunities;document.getElementById("pipelineKpi").textContent="OMR "+Number(d.weighted_pipeline||0).toLocaleString();document.getElementById("quoteKpi").textContent=d.quotes_awaiting_approval;document.getElementById("overdueKpi").textContent=d.overdue_followups;document.getElementById("authStatus").textContent="Connected ✓";document.getElementById("authStatus").style.color="green";let q=await api("/approvals");document.getElementById("quoteKpi").textContent=q.length;document.getElementById("reportOpps").textContent=d.hot_opportunities;document.getElementById("reportQuotes").textContent=q.length;}catch(e){document.getElementById("authStatus").textContent="Connection failed — check API key";document.getElementById("authStatus").style.color="#a11"}}
+async function createProductionQuote(){try{let customer=document.querySelector('#quotes input[placeholder="Customer name"]').value.trim();alert(customer?"Quotation draft can now be sent to the Lina API from this connected interface.":"Enter a customer first.")}catch(e){alert(e.message)}}
+if(API_KEY){document.getElementById("apiKey").value=API_KEY;loadLiveData()}
+function show(id,btn){document.querySelectorAll('main section').forEach(s=>s.classList.add('hidden'));document.getElementById(id).classList.remove('hidden');document.querySelectorAll('.nav button').forEach(b=>b.classList.remove('active'));if(btn)btn.classList.add('active')}
+function createLead(){let c=document.getElementById('country').value||'Selected market';let i=document.getElementById('industry').value;document.getElementById('leadResult').innerHTML='<div class="notice" style="margin-top:15px"><b>Research task created.</b> Lina will target '+c+' / '+i+' and return verified prospects, decision-makers, requirements, opportunity score and next action. External research/API connection is the next production step.</div>'}
+function margin(){let c=+document.getElementById('cost').value,s=+document.getElementById('sell').value,v=+document.getElementById('vat').value||0;let m=s-c,p=s?m/s*100:0,total=s*(1+v/100);document.getElementById('marginResult').innerHTML='<div class="notice" style="margin-top:15px">Gross margin: <b>OMR '+m.toFixed(2)+'</b> · Margin %: <b>'+p.toFixed(2)+'%</b> · Customer price incl. VAT: <b>OMR '+total.toFixed(2)+'</b>. <br>These are calculations only and require approval before use.</div>'}
+function askLina(){let input=document.getElementById('chatInput'),q=input.value.trim();if(!q)return;let msgs=document.getElementById('msgs');msgs.innerHTML+='<div class="msg user"><b>You:</b> '+q.replace(/</g,'&lt;')+'</div>';let a='I can prepare that, but I will not invent missing information or make an external commercial commitment. I would first check the relevant CRM, files, email/calendar and web sources, then return a recommendation for your approval.';if(/hot|opportunit/i.test(q))a='I would prioritize HOT opportunities first, then show value, stage, probability, next action and overdue follow-ups.';if(/quote|quotation/i.test(q))a='I can prepare a quotation draft and calculate margin/VAT. Pricing, discount, payment, delivery and warranty commitments remain subject to your approval.';if(/lead|prospect/i.test(q))a='I can research target accounts, decision-makers, projects and requirements, score each opportunity, and recommend the next action.';msgs.innerHTML+='<div class="msg lina"><b>Lina:</b> '+a+'</div>';input.value='';msgs.scrollTop=msgs.scrollHeight}
+</script>
+</body>
+</html>

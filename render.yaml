@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: lina-mbs
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: LINA_APP_NAME
+        value: Lina Business & Sales Manager
+      - key: LINA_OWNER
+        value: Khodor Ezzeddine
+      - key: LINA_API_KEY
+        sync: false
+      - key: LINA_AUTH_DISABLED
+        value: "false"
+      - key: LINA_ALLOWED_ORIGINS
+        value: "*"
+      - key: LINA_DATA_DIR
+        value: /var/data
+    disk:
+      name: lina-data
+      mountPath: /var/data
+      sizeGB: 1

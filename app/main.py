@@ -17,7 +17,7 @@ BRAVE_SEARCH_API_KEY = os.getenv('BRAVE_SEARCH_API_KEY', '').strip()
 AUTH_DISABLED = os.getenv('LINA_AUTH_DISABLED', 'false').lower() == 'true'
 ALLOWED_ORIGINS = [x.strip() for x in os.getenv('LINA_ALLOWED_ORIGINS', '*').split(',') if x.strip()]
 
-app = FastAPI(title=APP_NAME, version='11.0')
+app = FastAPI(title=APP_NAME, version='11.1')
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=['GET','POST','PUT','PATCH','DELETE'], allow_headers=['*'], allow_credentials=False)
 
 @app.middleware('http')
@@ -353,19 +353,35 @@ def discover_contacts(x:ContactDiscovery, actor:str=Depends(auth)):
         except HTTPException: pass
     emails={}; phones={}
     for page_url,markup in html_pages:
-        # Remove markup so phone patterns do not span attributes or scripts.
-        cleaned=re.sub(r'<(script|style)\b[^>]*>.*?</\1>',' ',markup,flags=re.I|re.S)
-        plain=html.unescape(re.sub(r'<[^>]+>',' ',cleaned))
-        plain=re.sub(r'\s+',' ',plain)
-        for email in EMAIL_RE.findall(plain+' '+ ' '.join(re.findall(r'mailto:([^\"\'<>? ]+)',markup,re.I))):
-            if len(email)<120 and not email.lower().endswith(('.png','.jpg','.webp','.svg')): emails.setdefault(email.lower(),page_url)
-        for phone in PHONE_RE.findall(plain):
-            digits=re.sub(r'\D','',phone)
-            if 8<=len(digits)<=15: phones.setdefault(phone.strip(),page_url)
+        cleaned=re.sub(r'<(script|style|svg|noscript)\b[^>]*>.*?</\1>',' ',markup,flags=re.I|re.S)
+        # Keep line boundaries: flattening an entire page creates false phone matches
+        # from unrelated years, postal codes, or neighboring numeric fields.
+        text=re.sub(r'</(?:p|div|li|tr|h[1-6]|address|br)\s*>','\n',cleaned,flags=re.I)
+        text=html.unescape(re.sub(r'<[^>]+>',' ',text))
+        for address in EMAIL_RE.findall(text+' '+' '.join(re.findall(r'mailto:([^"\'<>? ]+)',markup,re.I))):
+            if len(address)<120 and not address.lower().endswith(('.png','.jpg','.webp','.svg')):
+                emails.setdefault(address.lower(),page_url)
+        # Prioritize explicitly published click-to-call numbers.
+        candidates=[html.unescape(v) for v in re.findall(r'href\s*=\s*["\']tel:([^"\'<>]+)',markup,re.I)]
+        # Also consider short contact-labelled lines, never arbitrary page-wide numbers.
+        for line in text.splitlines():
+            line=re.sub(r'\s+',' ',line).strip()
+            if len(line)>180 or not re.search(r'\b(?:tel|telephone|phone|mobile|call|contact|switchboard|fax)\b|هاتف|اتصل|تليفون',line,re.I):
+                continue
+            candidates.extend(PHONE_RE.findall(line))
+        for candidate in candidates:
+            candidate=urllib.parse.unquote(candidate).split(';')[0].strip()
+            for match in PHONE_RE.findall(candidate):
+                digits=re.sub(r'\D','',match)
+                if not 8<=len(digits)<=15: continue
+                # Reject date-like or obvious sequential strings; retain source for review.
+                if re.fullmatch(r'(?:19|20)\d{6,}',digits) or len(set(digits))==1: continue
+                normalized=('+' if match.lstrip().startswith('+') else '')+digits
+                phones.setdefault(normalized,page_url)
     c=db(); audit(c,actor,'CONTACT_DISCOVERY','WEB_SOURCE',None,url); c.commit(); c.close()
     return {'source_url':url,'pages_checked':[p for p,_ in html_pages],
-        'emails':[{'value':v,'source_url':u,'verification_status':'FOUND_ON_PAGE_NOT_VERIFIED'} for v,u in list(emails.items())[:15]],
-        'phones':[{'value':v,'source_url':u,'verification_status':'FOUND_ON_PAGE_NOT_VERIFIED'} for v,u in list(phones.items())[:15]],
+        'emails':[{'value':v,'source_url':u,'verification_status':'FOUND_ON_PAGE_NOT_VERIFIED'} for v,u in list(emails.items())[:8]],
+        'phones':[{'value':v,'source_url':u,'verification_status':'FOUND_ON_PAGE_NOT_VERIFIED'} for v,u in list(phones.items())[:8]],
         'notice':'Automatically extracted public page text. Check each number/email manually; page presence does not establish ownership, current validity or a purchasing requirement.'}
 
 @app.get('/leads')

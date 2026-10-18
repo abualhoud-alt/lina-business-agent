@@ -17,7 +17,7 @@ BRAVE_SEARCH_API_KEY = os.getenv('BRAVE_SEARCH_API_KEY', '').strip()
 AUTH_DISABLED = os.getenv('LINA_AUTH_DISABLED', 'false').lower() == 'true'
 ALLOWED_ORIGINS = [x.strip() for x in os.getenv('LINA_ALLOWED_ORIGINS', '*').split(',') if x.strip()]
 
-app = FastAPI(title=APP_NAME, version='11.3.1')
+app = FastAPI(title=APP_NAME, version='11.3.2')
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=['GET','POST','PUT','PATCH','DELETE'], allow_headers=['*'], allow_credentials=False)
 
 @app.middleware('http')
@@ -94,11 +94,11 @@ def opportunity_score(row):
 
 
 @app.get('/health')
-def health(): return {'status':'ok','service':'Lina','version':'11.3.1','mode':'approval-controlled','lead_research_configured':bool(BRAVE_SEARCH_API_KEY)}
+def health(): return {'status':'ok','service':'Lina','version':'11.3.2','mode':'approval-controlled','lead_research_configured':bool(BRAVE_SEARCH_API_KEY)}
 @app.get('/', include_in_schema=False)
 def home(): return FileResponse(BASE/'static'/'index.html')
 @app.get('/config')
-def config(_:str=Depends(auth)): return {'app_name':APP_NAME,'owner':OWNER,'version':'11.3.1','lead_research_configured':bool(BRAVE_SEARCH_API_KEY),'approval_principle':f'Lina prepares/recommends; {OWNER} approves; Lina executes.'}
+def config(_:str=Depends(auth)): return {'app_name':APP_NAME,'owner':OWNER,'version':'11.3.2','lead_research_configured':bool(BRAVE_SEARCH_API_KEY),'approval_principle':f'Lina prepares/recommends; {OWNER} approves; Lina executes.'}
 
 @app.get('/dashboard')
 def dashboard(_:str=Depends(auth)):
@@ -439,12 +439,51 @@ def discover_contacts(x:ContactDiscovery, actor:str=Depends(auth)):
 def list_leads(_:str=Depends(auth)):
     c=db(); rows=[dict(r) for r in c.execute('SELECT * FROM leads ORDER BY id DESC')]; c.close(); return rows
 
+def ensure_crm_company(c, lead_id, lead):
+    """Create/link a CRM prospect without requiring contacts or implying a confirmed sale."""
+    name=(lead['company_name'] or '').strip()
+    country=(lead['country'] or '').strip()
+    website=(lead['website'] or '').strip()
+    # Prefer exact normalized name + country. Never merge distinct names based on domain alone.
+    existing=c.execute("SELECT id FROM companies WHERE lower(trim(name))=lower(?) AND lower(trim(COALESCE(country,'')))=lower(?)",(name,country)).fetchone()
+    if existing:
+        company_id=existing['id']
+    else:
+        notes=f"Unverified research prospect; lead #{lead_id}. Source: {lead['source_url'] or 'not supplied'}. Verify buyer identity and need before outreach."
+        cur=c.execute('INSERT INTO companies(name,country,industry,website,type,notes,created_at) VALUES(?,?,?,?,?,?,?)',(name,country,lead['industry'],website,'prospect',notes,now()))
+        company_id=cur.lastrowid
+    return company_id
+
 @app.post('/leads')
 def create_lead(x:LeadCreate, actor:str=Depends(auth)):
     if not x.company_name.strip(): raise HTTPException(400,'Company name is required')
     status=x.verification_status.upper()
     if status not in {'UNVERIFIED','PARTIALLY_VERIFIED','VERIFIED'}: raise HTTPException(400,'Invalid verification status')
-    c=db(); cur=c.execute("INSERT INTO leads(company_name,country,industry,website,contact_name,contact_title,phone,email,source_url,source_title,source_snippet,verification_status,lead_status,research_query,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(x.company_name.strip(),x.country,x.industry,x.website,x.contact_name,x.contact_title,x.phone,x.email,x.source_url,x.source_title,x.source_snippet,status,'NEW',x.research_query,now())); audit(c,actor,'CREATE','LEAD',cur.lastrowid,x.company_name); c.commit(); out=dict(c.execute('SELECT * FROM leads WHERE id=?',(cur.lastrowid,)).fetchone()); c.close(); return out
+    c=db()
+    try:
+        # Avoid duplicate research records for the same organization and exact source.
+        existing=c.execute("SELECT * FROM leads WHERE lower(trim(company_name))=lower(?) AND lower(trim(COALESCE(country,'')))=lower(?) AND COALESCE(source_url,'')=? ORDER BY id LIMIT 1",(x.company_name.strip(),x.country.strip(),x.source_url)).fetchone()
+        if existing:
+            lead_id=existing['id']
+            lead=existing
+        else:
+            cur=c.execute("INSERT INTO leads(company_name,country,industry,website,contact_name,contact_title,phone,email,source_url,source_title,source_snippet,verification_status,lead_status,research_query,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(x.company_name.strip(),x.country,x.industry,x.website,x.contact_name,x.contact_title,x.phone,x.email,x.source_url,x.source_title,x.source_snippet,status,'NEW',x.research_query,now()))
+            lead_id=cur.lastrowid
+            lead=c.execute('SELECT * FROM leads WHERE id=?',(lead_id,)).fetchone()
+            audit(c,actor,'CREATE','LEAD',lead_id,x.company_name)
+        company_id=ensure_crm_company(c,lead_id,lead)
+        c.execute("UPDATE leads SET lead_status='PROMOTED' WHERE id=?",(lead_id,))
+        audit(c,actor,'LINK_TO_CRM','LEAD',lead_id,f'company_id={company_id}')
+        c.commit()
+        out=dict(c.execute('SELECT * FROM leads WHERE id=?',(lead_id,)).fetchone())
+        out['company_id']=company_id
+        out['already_saved']=bool(existing)
+        return out
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
 
 @app.put('/leads/{lead_id}')
 def update_lead(lead_id:int, x:LeadCreate, actor:str=Depends(auth)):
@@ -459,11 +498,7 @@ def update_lead(lead_id:int, x:LeadCreate, actor:str=Depends(auth)):
 def promote_lead(lead_id:int, actor:str=Depends(auth)):
     c=db(); lead=c.execute('SELECT * FROM leads WHERE id=?',(lead_id,)).fetchone()
     if not lead: c.close(); raise HTTPException(404,'lead not found')
-    existing=c.execute('SELECT id FROM companies WHERE lower(name)=lower(?) AND lower(COALESCE(country,\'\'))=lower(?)',(lead['company_name'],lead['country'])).fetchone()
-    if existing:
-        company_id=existing['id']
-    else:
-        cur=c.execute('INSERT INTO companies(name,country,industry,website,type,notes,created_at) VALUES(?,?,?,?,?,?,?)',(lead['company_name'],lead['country'],lead['industry'],lead['website'],'prospect',f"Imported from lead #{lead_id}. Source: {lead['source_url']}",now())); company_id=cur.lastrowid
+    company_id=ensure_crm_company(c,lead_id,lead)
     if lead['contact_name'] and not c.execute('SELECT 1 FROM contacts WHERE company_id=? AND lower(name)=lower(?)',(company_id,lead['contact_name'])).fetchone():
         c.execute('INSERT INTO contacts(company_id,name,title,email,phone,notes,created_at) VALUES(?,?,?,?,?,?,?)',(company_id,lead['contact_name'],lead['contact_title'],lead['email'],lead['phone'],f"Source: {lead['source_url']} | Verification: {lead['verification_status']}",now()))
     c.execute("UPDATE leads SET lead_status='PROMOTED' WHERE id=?",(lead_id,)); audit(c,actor,'PROMOTE_TO_CRM','LEAD',lead_id,f'company_id={company_id}'); c.commit(); c.close(); return {'status':'PROMOTED','company_id':company_id,'verification_status':lead['verification_status'],'note':'Lead imported to CRM. Verify source and contact details before outreach.'}

@@ -17,7 +17,7 @@ BRAVE_SEARCH_API_KEY = os.getenv('BRAVE_SEARCH_API_KEY', '').strip()
 AUTH_DISABLED = os.getenv('LINA_AUTH_DISABLED', 'false').lower() == 'true'
 ALLOWED_ORIGINS = [x.strip() for x in os.getenv('LINA_ALLOWED_ORIGINS', '*').split(',') if x.strip()]
 
-app = FastAPI(title=APP_NAME, version='11.1')
+app = FastAPI(title=APP_NAME, version='11.2')
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=['GET','POST','PUT','PATCH','DELETE'], allow_headers=['*'], allow_credentials=False)
 
 @app.middleware('http')
@@ -94,11 +94,11 @@ def opportunity_score(row):
 
 
 @app.get('/health')
-def health(): return {'status':'ok','service':'Lina','version':'11.0','mode':'approval-controlled','lead_research_configured':bool(BRAVE_SEARCH_API_KEY)}
+def health(): return {'status':'ok','service':'Lina','version':'11.2','mode':'approval-controlled','lead_research_configured':bool(BRAVE_SEARCH_API_KEY)}
 @app.get('/', include_in_schema=False)
 def home(): return FileResponse(BASE/'static'/'index.html')
 @app.get('/config')
-def config(_:str=Depends(auth)): return {'app_name':APP_NAME,'owner':OWNER,'version':'11.0','lead_research_configured':bool(BRAVE_SEARCH_API_KEY),'approval_principle':f'Lina prepares/recommends; {OWNER} approves; Lina executes.'}
+def config(_:str=Depends(auth)): return {'app_name':APP_NAME,'owner':OWNER,'version':'11.2','lead_research_configured':bool(BRAVE_SEARCH_API_KEY),'approval_principle':f'Lina prepares/recommends; {OWNER} approves; Lina executes.'}
 
 @app.get('/dashboard')
 def dashboard(_:str=Depends(auth)):

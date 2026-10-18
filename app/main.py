@@ -1,4 +1,4 @@
-import json, os, secrets, sqlite3, urllib.parse, urllib.request, urllib.error
+import json, os, secrets, sqlite3, urllib.parse, urllib.request, urllib.error, re, ipaddress, socket, html
 from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import FastAPI, Depends, HTTPException, Header
@@ -17,7 +17,7 @@ BRAVE_SEARCH_API_KEY = os.getenv('BRAVE_SEARCH_API_KEY', '').strip()
 AUTH_DISABLED = os.getenv('LINA_AUTH_DISABLED', 'false').lower() == 'true'
 ALLOWED_ORIGINS = [x.strip() for x in os.getenv('LINA_ALLOWED_ORIGINS', '*').split(',') if x.strip()]
 
-app = FastAPI(title=APP_NAME, version='10.0')
+app = FastAPI(title=APP_NAME, version='11.0')
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=['GET','POST','PUT','PATCH','DELETE'], allow_headers=['*'], allow_credentials=False)
 
 @app.middleware('http')
@@ -73,6 +73,7 @@ class Invoice(BaseModel): company_id:int; opportunity_id:int|None=None; invoice_
 class ResearchTask(BaseModel): country:str; industry:str=''; solution:str=''; objective:str=''
 class Settings(BaseModel): company_name:str; country:str=''; website:str=''; sales_email:str=''; info_email:str=''; currency:str='OMR'; phone:str=''
 class LeadSearch(BaseModel): country:str; industry:str=''; solution:str=''; keywords:str=''; count:int=10
+class ContactDiscovery(BaseModel): url:str
 class LeadCreate(BaseModel): company_name:str; country:str=''; industry:str=''; website:str=''; contact_name:str=''; contact_title:str=''; phone:str=''; email:str=''; source_url:str=''; source_title:str=''; source_snippet:str=''; verification_status:str='UNVERIFIED'; research_query:str=''
 
 class CompanyUpdate(BaseModel): name:str; country:str=''; industry:str=''; website:str=''; type:str='prospect'; notes:str=''
@@ -93,11 +94,11 @@ def opportunity_score(row):
 
 
 @app.get('/health')
-def health(): return {'status':'ok','service':'Lina','version':'10.0','mode':'approval-controlled','lead_research_configured':bool(BRAVE_SEARCH_API_KEY)}
+def health(): return {'status':'ok','service':'Lina','version':'11.0','mode':'approval-controlled','lead_research_configured':bool(BRAVE_SEARCH_API_KEY)}
 @app.get('/', include_in_schema=False)
 def home(): return FileResponse(BASE/'static'/'index.html')
 @app.get('/config')
-def config(_:str=Depends(auth)): return {'app_name':APP_NAME,'owner':OWNER,'version':'10.0','lead_research_configured':bool(BRAVE_SEARCH_API_KEY),'approval_principle':f'Lina prepares/recommends; {OWNER} approves; Lina executes.'}
+def config(_:str=Depends(auth)): return {'app_name':APP_NAME,'owner':OWNER,'version':'11.0','lead_research_configured':bool(BRAVE_SEARCH_API_KEY),'approval_principle':f'Lina prepares/recommends; {OWNER} approves; Lina executes.'}
 
 @app.get('/dashboard')
 def dashboard(_:str=Depends(auth)):
@@ -231,28 +232,141 @@ def create_research(x:ResearchTask, actor:str=Depends(auth)):
 def research(_:str=Depends(auth)):
     c=db(); rows=[dict(r) for r in c.execute('SELECT * FROM research_tasks ORDER BY id DESC')]; c.close(); return rows
 
+# Buyer-first prospecting is a research aid, not proof of purchase intent.
+BUYERS = {
+    'education': 'private school university college campus educational institution',
+    'healthcare': 'hospital clinic medical centre healthcare provider',
+    'government': 'ministry municipality government authority public institution',
+    'banking': 'bank financial institution credit union',
+    'hospitality': 'hotel resort hospitality group',
+    'corporate': 'corporate headquarters business enterprise',
+    'manufacturing': 'factory manufacturing plant industrial company',
+    'retail': 'shopping mall supermarket retail chain',
+}
+SUPPLIER_MARKERS = ('supplier', 'suppliers', 'distributor', 'dealer', 'reseller', 'wholesaler',
+    'manufacturer', 'solutions provider', 'systems integrator', 'buy now', 'shop now', 'for sale',
+    'we supply', 'our products', 'we install', 'price list', 'top 5', 'top 10', 'best suppliers')
+BUYER_MARKERS = ('school', 'university', 'college', 'academy', 'campus', 'hospital', 'clinic',
+    'ministry', 'municipality', 'government', 'bank', 'hotel', 'resort', 'factory',
+    'retail chain', 'shopping mall', 'institution')
+SIGNAL_MARKERS = ('tender', 'rfp', 'request for proposal', 'procurement notice', 'invitation to bid',
+    'request for quotation', 'expansion project', 'new campus')
+
+def classify_result(item):
+    title=item.get('title','') or ''
+    desc=item.get('description','') or ''
+    blob=(title+' '+desc).lower()
+    supplier=any(t in blob for t in SUPPLIER_MARKERS)
+    buyer=any(t in blob for t in BUYER_MARKERS)
+    signals=[t for t in SIGNAL_MARKERS if t in blob]
+    if supplier: category='SUPPLIER_OR_COMPETITOR'
+    elif buyer: category='POTENTIAL_BUYER'
+    else: category='UNCLASSIFIED'
+    score= (55 if category=='POTENTIAL_BUYER' else 10 if supplier else 25) + (15 if signals else 0)
+    return {'category':category,'lead_score':min(score,70),'buying_signals':signals,
+            'qualification_note':'Keyword-based classification; manually verify the organization and any buying signal.'}
+
+def brave_search(query,count):
+    url='https://api.search.brave.com/res/v1/web/search?'+urllib.parse.urlencode({'q':query,'count':count})
+    req=urllib.request.Request(url,headers={'Accept':'application/json','X-Subscription-Token':BRAVE_SEARCH_API_KEY,'User-Agent':'LinaBusinessAgent/11.0'})
+    try:
+        with urllib.request.urlopen(req,timeout=20) as response: payload=json.loads(response.read(750000).decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        raise HTTPException(502, 'Search provider rejected the request; check API access and rate limits.' if e.code in (401,403,429) else f'Search provider HTTP error {e.code}.')
+    except (TimeoutError,urllib.error.URLError,ValueError):
+        raise HTTPException(502,'Web search failed to respond. Please retry later.')
+    return payload.get('web',{}).get('results',[])
+
 @app.post('/lead-hunter/search')
 def lead_hunter_search(x:LeadSearch, actor:str=Depends(auth)):
-    """Search the public web using the configured Brave Search API; results are candidates, not verified contacts."""
-    if not BRAVE_SEARCH_API_KEY:
-        raise HTTPException(503, 'Web research is not configured. Add BRAVE_SEARCH_API_KEY in Render Environment, then redeploy. No web search was performed.')
-    if not x.country.strip(): raise HTTPException(400, 'Target country is required')
-    query=' '.join(part for part in [x.industry, x.solution, x.keywords, 'companies', x.country, 'contact'] if part and part.strip())
+    if not BRAVE_SEARCH_API_KEY: raise HTTPException(503,'Configure BRAVE_SEARCH_API_KEY in Render Environment.')
+    if not x.country.strip(): raise HTTPException(400,'Target country is required')
     count=max(1,min(int(x.count or 10),20))
-    url='https://api.search.brave.com/res/v1/web/search?'+urllib.parse.urlencode({'q':query,'count':count})
-    req=urllib.request.Request(url,headers={'Accept':'application/json','X-Subscription-Token':BRAVE_SEARCH_API_KEY,'User-Agent':'LinaBusinessAgent/10.0'})
+    buyers=BUYERS.get(x.industry.lower().strip(), 'organization institution')
+    # Do not require the product keyword: it tends to retrieve vendors instead of buyers.
+    query=f'{buyers} {x.country} official website contact procurement'
+    if x.keywords.strip():
+        query+=' '+ ' '.join(x.keywords.split()[:8])
+    raw=brave_search(query,count)
+    results=[]; seen=set()
+    for item in raw:
+        link=item.get('url','')
+        parsed=urllib.parse.urlsplit(link)
+        if parsed.scheme!='https' or not parsed.hostname or link in seen: continue
+        seen.add(link)
+        row={'title':item.get('title',''),'url':link,'description':item.get('description',''),
+             'source':'Brave Search','verification_status':'UNVERIFIED'}
+        row.update(classify_result(row)); results.append(row)
+    results.sort(key=lambda r:(r['category']!='POTENTIAL_BUYER',-r['lead_score']))
+    c=db(); cur=c.execute('INSERT INTO research_tasks(country,industry,solution,objective,status,created_at) VALUES(?,?,?,?,?,?)',
+        (x.country,x.industry,x.solution,'Buyer-first search: '+query,'COMPLETED' if results else 'NO_RESULTS',now()))
+    task_id=cur.lastrowid; audit(c,actor,'WEB_SEARCH','RESEARCH_TASK',task_id,query); c.commit(); c.close()
+    return {'query':query,'count':len(results),'results':results,'task_id':task_id,
+        'notice':'Buyer categories and scores are preliminary. Results are not confirmed purchasing needs. Use Discover public contacts on relevant official websites.'}
+
+# Only fetch public HTTPS pages. Reject internal/reserved IP addresses and redirects.
+def public_host(host):
+    if not host or host.lower() in ('localhost',) or host.lower().endswith(('.local','.internal')): return False
     try:
-        with urllib.request.urlopen(req,timeout=20) as response: payload=json.loads(response.read().decode('utf-8'))
-    except urllib.error.HTTPError as e:
-        detail='Search provider rejected the request. Check the API key and plan.' if e.code in (401,403,429) else f'Search provider HTTP error {e.code}.'
-        raise HTTPException(502,detail)
-    except Exception as e:
-        raise HTTPException(502,'Web search failed to respond. Please retry later.')
-    results=[]
-    for item in payload.get('web',{}).get('results',[]):
-        results.append({'title':item.get('title',''),'url':item.get('url',''),'description':item.get('description',''),'source':'Brave Search','verification_status':'UNVERIFIED'})
-    c=db(); cur=c.execute('INSERT INTO research_tasks(country,industry,solution,objective,status,created_at) VALUES(?,?,?,?,?,?)',(x.country,x.industry,x.solution,('Public web search: '+query),'COMPLETED' if results else 'NO_RESULTS',now())); audit(c,actor,'WEB_SEARCH','RESEARCH_TASK',cur.lastrowid,query); c.commit(); c.close()
-    return {'query':query,'count':len(results),'results':results,'task_id':cur.lastrowid,'notice':'Search results are candidate sources only. People, phone numbers and emails must be verified from the linked source before outreach.'}
+        addresses=socket.getaddrinfo(host,443,type=socket.SOCK_STREAM)
+        return bool(addresses) and all(ipaddress.ip_address(entry[4][0]).is_global for entry in addresses)
+    except (OSError,ValueError): return False
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self,req,fp,code,msg,headers,newurl): return None
+
+CONTACT_LINK_RE=re.compile(r'href\s*=\s*[\"\']([^\"\']+)[\"\']',re.I)
+EMAIL_RE=re.compile(r'(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w.-])',re.I)
+PHONE_RE=re.compile(r'(?<!\w)(?:\+?\d[\d\s().-]{7,18}\d)(?!\w)')
+
+def fetch_public_html(url):
+    parsed=urllib.parse.urlsplit(url)
+    if parsed.scheme!='https' or parsed.username or parsed.password or parsed.port not in (None,443) or not public_host(parsed.hostname):
+        raise HTTPException(400,'Only public HTTPS websites are supported.')
+    opener=urllib.request.build_opener(NoRedirect)
+    req=urllib.request.Request(url,headers={'User-Agent':'LinaBusinessAgent/11.0 (+public business contact research)','Accept':'text/html'})
+    try:
+        with opener.open(req,timeout=7) as resp:
+            if 'text/html' not in resp.headers.get('Content-Type','').lower(): raise HTTPException(422,'Source is not an HTML page.')
+            return resp.read(200000).decode('utf-8','replace')
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(422,'Website could not be read without redirect or restriction.')
+    except (urllib.error.URLError,TimeoutError,OSError):
+        raise HTTPException(502,'Website could not be reached.')
+
+@app.post('/lead-hunter/discover-contacts')
+def discover_contacts(x:ContactDiscovery, actor:str=Depends(auth)):
+    url=x.url.strip()
+    parsed=urllib.parse.urlsplit(url)
+    if len(url)>2048 or parsed.scheme!='https': raise HTTPException(400,'A public HTTPS source URL is required.')
+    origin=f'https://{parsed.hostname}' if parsed.hostname else ''
+    if not origin: raise HTTPException(400,'Invalid source URL')
+    html_pages=[]; first=fetch_public_html(url); html_pages.append((url,first))
+    links=[]
+    for href in CONTACT_LINK_RE.findall(first):
+        candidate=urllib.parse.urljoin(url,html.unescape(href))
+        cp=urllib.parse.urlsplit(candidate)
+        if cp.hostname==parsed.hostname and cp.scheme=='https' and any(word in cp.path.lower() for word in ('contact','about','directory')):
+            if candidate not in links and candidate!=url: links.append(candidate)
+    for link in links[:2]:
+        try: html_pages.append((link,fetch_public_html(link)))
+        except HTTPException: pass
+    emails={}; phones={}
+    for page_url,markup in html_pages:
+        # Remove markup so phone patterns do not span attributes or scripts.
+        cleaned=re.sub(r'<(script|style)\b[^>]*>.*?</\1>',' ',markup,flags=re.I|re.S)
+        plain=html.unescape(re.sub(r'<[^>]+>',' ',cleaned))
+        plain=re.sub(r'\s+',' ',plain)
+        for email in EMAIL_RE.findall(plain+' '+ ' '.join(re.findall(r'mailto:([^\"\'<>? ]+)',markup,re.I))):
+            if len(email)<120 and not email.lower().endswith(('.png','.jpg','.webp','.svg')): emails.setdefault(email.lower(),page_url)
+        for phone in PHONE_RE.findall(plain):
+            digits=re.sub(r'\D','',phone)
+            if 8<=len(digits)<=15: phones.setdefault(phone.strip(),page_url)
+    c=db(); audit(c,actor,'CONTACT_DISCOVERY','WEB_SOURCE',None,url); c.commit(); c.close()
+    return {'source_url':url,'pages_checked':[p for p,_ in html_pages],
+        'emails':[{'value':v,'source_url':u,'verification_status':'FOUND_ON_PAGE_NOT_VERIFIED'} for v,u in list(emails.items())[:15]],
+        'phones':[{'value':v,'source_url':u,'verification_status':'FOUND_ON_PAGE_NOT_VERIFIED'} for v,u in list(phones.items())[:15]],
+        'notice':'Automatically extracted public page text. Check each number/email manually; page presence does not establish ownership, current validity or a purchasing requirement.'}
 
 @app.get('/leads')
 def list_leads(_:str=Depends(auth)):

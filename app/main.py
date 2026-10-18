@@ -17,7 +17,7 @@ BRAVE_SEARCH_API_KEY = os.getenv('BRAVE_SEARCH_API_KEY', '').strip()
 AUTH_DISABLED = os.getenv('LINA_AUTH_DISABLED', 'false').lower() == 'true'
 ALLOWED_ORIGINS = [x.strip() for x in os.getenv('LINA_ALLOWED_ORIGINS', '*').split(',') if x.strip()]
 
-app = FastAPI(title=APP_NAME, version='11.2')
+app = FastAPI(title=APP_NAME, version='11.3.1')
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=['GET','POST','PUT','PATCH','DELETE'], allow_headers=['*'], allow_credentials=False)
 
 @app.middleware('http')
@@ -72,7 +72,7 @@ class Quote(BaseModel): company_id:int; opportunity_id:int|None=None; quote_no:s
 class Invoice(BaseModel): company_id:int; opportunity_id:int|None=None; invoice_no:str=''; amount:float=0; vat:float=5; due_date:str=''; payment_status:str='UNPAID'; outstanding:float=0
 class ResearchTask(BaseModel): country:str; industry:str=''; solution:str=''; objective:str=''
 class Settings(BaseModel): company_name:str; country:str=''; website:str=''; sales_email:str=''; info_email:str=''; currency:str='OMR'; phone:str=''
-class LeadSearch(BaseModel): country:str; industry:str=''; solution:str=''; keywords:str=''; count:int=10
+class LeadSearch(BaseModel): country:str; industry:str=''; solution:str=''; keywords:str=''; objective:str=''; count:int=10
 class ContactDiscovery(BaseModel): url:str
 class LeadCreate(BaseModel): company_name:str; country:str=''; industry:str=''; website:str=''; contact_name:str=''; contact_title:str=''; phone:str=''; email:str=''; source_url:str=''; source_title:str=''; source_snippet:str=''; verification_status:str='UNVERIFIED'; research_query:str=''
 
@@ -94,11 +94,11 @@ def opportunity_score(row):
 
 
 @app.get('/health')
-def health(): return {'status':'ok','service':'Lina','version':'11.2','mode':'approval-controlled','lead_research_configured':bool(BRAVE_SEARCH_API_KEY)}
+def health(): return {'status':'ok','service':'Lina','version':'11.3.1','mode':'approval-controlled','lead_research_configured':bool(BRAVE_SEARCH_API_KEY)}
 @app.get('/', include_in_schema=False)
 def home(): return FileResponse(BASE/'static'/'index.html')
 @app.get('/config')
-def config(_:str=Depends(auth)): return {'app_name':APP_NAME,'owner':OWNER,'version':'11.2','lead_research_configured':bool(BRAVE_SEARCH_API_KEY),'approval_principle':f'Lina prepares/recommends; {OWNER} approves; Lina executes.'}
+def config(_:str=Depends(auth)): return {'app_name':APP_NAME,'owner':OWNER,'version':'11.3.1','lead_research_configured':bool(BRAVE_SEARCH_API_KEY),'approval_principle':f'Lina prepares/recommends; {OWNER} approves; Lina executes.'}
 
 @app.get('/dashboard')
 def dashboard(_:str=Depends(auth)):
@@ -233,42 +233,60 @@ def research(_:str=Depends(auth)):
     c=db(); rows=[dict(r) for r in c.execute('SELECT * FROM research_tasks ORDER BY id DESC')]; c.close(); return rows
 
 # Buyer-first prospecting is a research aid, not proof of purchase intent.
+MBS_SOLUTIONS = {
+    'Printing & Document Solutions': ('managed printing document scanning', 'printing fleet document workflows'),
+    'Software & Digital Solutions': ('document management digital archiving OCR', 'workflow automation business applications'),
+    'AV & Display Solutions': ('interactive displays LED screens', 'meeting room video conferencing digital signage'),
+    'Identification Solutions': ('employee ID cards card printers', 'student ID cards identification'),
+    'Queue Management Systems': ('customer service waiting area', 'patient registration service counters'),
+}
 BUYERS = {
-    'education': 'private school university college campus educational institution',
+    'education': 'school university college educational institution',
     'healthcare': 'hospital clinic medical centre healthcare provider',
     'government': 'ministry municipality government authority public institution',
-    'banking': 'bank financial institution credit union',
+    'banking': 'bank financial institution',
     'hospitality': 'hotel resort hospitality group',
-    'corporate': 'corporate headquarters business enterprise',
+    'corporate': 'corporate headquarters enterprise office',
     'manufacturing': 'factory manufacturing plant industrial company',
     'retail': 'shopping mall supermarket retail chain',
 }
-SUPPLIER_MARKERS = ('supplier', 'suppliers', 'distributor', 'dealer', 'reseller', 'wholesaler',
-    'manufacturer', 'solutions provider', 'systems integrator', 'buy now', 'shop now', 'for sale',
-    'we supply', 'our products', 'we install', 'price list', 'top 5', 'top 10', 'best suppliers')
+SUPPLIER_MARKERS = ('supplier', 'distributor', 'dealer', 'reseller', 'wholesaler',
+    'manufacturer', 'solutions provider', 'systems integrator', 'buy now', 'shop now',
+    'we supply', 'our products', 'we install', 'price list', 'best suppliers')
+DIRECTORY_MARKERS = ('business directory', 'company directory', 'yellow pages', 'top 10',
+    'top 5', 'list of companies', 'find companies', 'tendersinfo', 'tender portal',
+    'tender aggregator', 'business listing')
 BUYER_MARKERS = ('school', 'university', 'college', 'academy', 'campus', 'hospital', 'clinic',
     'ministry', 'municipality', 'government', 'bank', 'hotel', 'resort', 'factory',
-    'retail chain', 'shopping mall', 'institution')
-SIGNAL_MARKERS = ('tender', 'rfp', 'request for proposal', 'procurement notice', 'invitation to bid',
-    'request for quotation', 'expansion project', 'new campus')
+    'retail chain', 'shopping mall', 'institution', 'company', 'corporation', 'group')
+SIGNAL_MARKERS = ('tender', 'rfp', 'request for proposal', 'procurement notice',
+    'invitation to bid', 'request for quotation', 'expansion project', 'new campus')
 
 def classify_result(item):
     title=item.get('title','') or ''
     desc=item.get('description','') or ''
     blob=(title+' '+desc).lower()
+    domain=(urllib.parse.urlsplit(item.get('url','')).hostname or '').lower()
+    directory=any(t in blob or t in domain for t in DIRECTORY_MARKERS)
     supplier=any(t in blob for t in SUPPLIER_MARKERS)
     buyer=any(t in blob for t in BUYER_MARKERS)
     signals=[t for t in SIGNAL_MARKERS if t in blob]
-    if supplier: category='SUPPLIER_OR_COMPETITOR'
+    if directory: category='DIRECTORY_OR_AGGREGATOR'
+    elif supplier: category='SUPPLIER_OR_COMPETITOR'
     elif buyer: category='POTENTIAL_BUYER'
     else: category='UNCLASSIFIED'
-    score= (55 if category=='POTENTIAL_BUYER' else 10 if supplier else 25) + (15 if signals else 0)
-    return {'category':category,'lead_score':min(score,70),'buying_signals':signals,
-            'qualification_note':'Keyword-based classification; manually verify the organization and any buying signal.'}
+    # Ranking heuristic only. A search snippet cannot verify purchasing intent.
+    score=(50 if category=='POTENTIAL_BUYER' else 5 if supplier or directory else 20) + (10 if signals and category=='POTENTIAL_BUYER' else 0)
+    return {'category':category,'lead_score':score,'score_type':'SEARCH_RANKING_HEURISTIC','buying_signals':signals,
+            'opportunity_type':'POTENTIAL_CUSTOMER' if category=='POTENTIAL_BUYER' else 'RESEARCH_SOURCE',
+            'buying_requirement_verified':False,
+            'contact_status':'NOT_RESEARCHED',
+            'next_action':'Verify organization and official website; research procurement/IT contacts. Keep lead even without contact details.' if category=='POTENTIAL_BUYER' else 'Verify this is a real buyer organization before saving.',
+            'qualification_note':'Preliminary keyword-based classification, not a verified buying requirement.'}
 
 def brave_search(query,count):
     url='https://api.search.brave.com/res/v1/web/search?'+urllib.parse.urlencode({'q':query,'count':count})
-    req=urllib.request.Request(url,headers={'Accept':'application/json','X-Subscription-Token':BRAVE_SEARCH_API_KEY,'User-Agent':'LinaBusinessAgent/11.0'})
+    req=urllib.request.Request(url,headers={'Accept':'application/json','X-Subscription-Token':BRAVE_SEARCH_API_KEY,'User-Agent':'LinaBusinessAgent/11.3.1'})
     try:
         with urllib.request.urlopen(req,timeout=20) as response: payload=json.loads(response.read(750000).decode('utf-8'))
     except urllib.error.HTTPError as e:
@@ -277,32 +295,65 @@ def brave_search(query,count):
         raise HTTPException(502,'Web search failed to respond. Please retry later.')
     return payload.get('web',{}).get('results',[])
 
+@app.get('/lead-hunter/portfolio')
+def lead_portfolio(_:str=Depends(auth)):
+    return {'solutions':list(MBS_SOLUTIONS),'note':'All MBS solutions can be researched. Results are candidates, not confirmed demand.'}
+
 @app.post('/lead-hunter/search')
 def lead_hunter_search(x:LeadSearch, actor:str=Depends(auth)):
     if not BRAVE_SEARCH_API_KEY: raise HTTPException(503,'Configure BRAVE_SEARCH_API_KEY in Render Environment.')
     if not x.country.strip(): raise HTTPException(400,'Target country is required')
     count=max(1,min(int(x.count or 10),20))
-    buyers=BUYERS.get(x.industry.lower().strip(), 'organization institution')
-    # Do not require the product keyword: it tends to retrieve vendors instead of buyers.
-    query=f'{buyers} {x.country} official website contact procurement'
+    buyers=BUYERS.get(x.industry.lower().strip(), 'company organization institution office')
+    all_portfolio=not x.solution.strip() or x.solution.strip().lower() in ('all','all mbs solutions','all products & services')
+    # Two broad buyer-first searches for all-portfolio mode, one for a specific solution.
+    # Product terms are deliberately NOT mandatory, to avoid returning only suppliers.
+    queries=[f'{buyers} {x.country.strip()} official website contact']
+    if all_portfolio:
+        queries.append(f'{buyers} {x.country.strip()} companies organizations branches facilities official website')
     if x.keywords.strip():
-        query+=' '+ ' '.join(x.keywords.split()[:8])
-    raw=brave_search(query,count)
-    results=[]; seen=set()
-    for item in raw:
-        link=item.get('url','')
-        parsed=urllib.parse.urlsplit(link)
-        if parsed.scheme!='https' or not parsed.hostname or link in seen: continue
-        seen.add(link)
-        row={'title':item.get('title',''),'url':link,'description':item.get('description',''),
-             'source':'Brave Search','verification_status':'UNVERIFIED'}
-        row.update(classify_result(row)); results.append(row)
+        queries=[q+' '+' '.join(x.keywords.split()[:6]) for q in queries]
+    # The objective changes research strategy, not merely the stored task label.
+    # Still retain a broad buyer search so procurement-only queries do not hide prospects.
+    objective=x.objective.lower().strip()
+    intent_terms=('tender','rfp','rfq','procurement','purchase','purchasing','project','expansion','requirement','bid')
+    if any(term in objective for term in intent_terms):
+        queries.append(f'{buyers} {x.country.strip()} procurement tender RFP project official site')
+    elif any(term in objective for term in ('new business','new customer','potential customer','prospect','market')):
+        queries.append(f'{buyers} {x.country.strip()} organizations institutions new branches official website')
+    # Limit queries to control API usage and preserve relevance.
+    queries=queries[:3]
+    results=[]; seen=set(); errors=[]
+    per_query=min(20,max(count,8))
+    for query in queries:
+        try: raw=brave_search(query,per_query)
+        except HTTPException as exc:
+            errors.append(str(exc.detail)); continue
+        for item in raw:
+            link=item.get('url','')
+            parsed=urllib.parse.urlsplit(link)
+            if parsed.scheme!='https' or not parsed.hostname: continue
+            key=(parsed.hostname.lower().removeprefix('www.'),parsed.path.rstrip('/').lower())
+            if key in seen: continue
+            seen.add(key)
+            row={'title':item.get('title',''),'url':link,'description':item.get('description',''),
+                 'source':'Brave Search','verification_status':'UNVERIFIED'}
+            row.update(classify_result(row))
+            if all_portfolio:
+                row['suggested_solutions']=list(MBS_SOLUTIONS)
+                row['solution_note']='Portfolio possibilities only; confirm fit before proposing.'
+            else:
+                row['suggested_solutions']=[x.solution.strip()]
+                row['solution_note']='User-selected solution; fit not yet confirmed.'
+            results.append(row)
+    if not results and errors: raise HTTPException(502,'; '.join(errors))
     results.sort(key=lambda r:(r['category']!='POTENTIAL_BUYER',-r['lead_score']))
+    results=results[:count]
     c=db(); cur=c.execute('INSERT INTO research_tasks(country,industry,solution,objective,status,created_at) VALUES(?,?,?,?,?,?)',
-        (x.country,x.industry,x.solution,'Buyer-first search: '+query,'COMPLETED' if results else 'NO_RESULTS',now()))
-    task_id=cur.lastrowid; audit(c,actor,'WEB_SEARCH','RESEARCH_TASK',task_id,query); c.commit(); c.close()
-    return {'query':query,'count':len(results),'results':results,'task_id':task_id,
-        'notice':'Buyer categories and scores are preliminary. Results are not confirmed purchasing needs. Use Discover public contacts on relevant official websites.'}
+        (x.country,x.industry,x.solution or 'All MBS Solutions',x.objective.strip() or 'Identify potential buyer organizations', 'COMPLETED' if results else 'NO_RESULTS',now()))
+    task_id=cur.lastrowid; audit(c,actor,'WEB_SEARCH','RESEARCH_TASK',task_id,' | '.join(queries)); c.commit(); c.close()
+    return {'query':' | '.join(queries),'count':len(results),'results':results,'task_id':task_id,
+        'notice':'Phone and email are optional. Scores rank search snippets only, not purchase likelihood. No active requirement is verified by this search. Verify organizations and any buying signal at its primary source.'}
 
 # Only fetch public HTTPS pages. Reject internal/reserved IP addresses and redirects.
 def public_host(host):

@@ -19,7 +19,7 @@ BRAVE_SEARCH_API_KEY = os.getenv('BRAVE_SEARCH_API_KEY', '').strip()
 AUTH_DISABLED = os.getenv('LINA_AUTH_DISABLED', 'false').lower() == 'true'
 ALLOWED_ORIGINS = [x.strip() for x in os.getenv('LINA_ALLOWED_ORIGINS', '*').split(',') if x.strip()]
 
-app = FastAPI(title=APP_NAME, version='11.4.1')
+app = FastAPI(title=APP_NAME, version='11.4.2')
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=['GET','POST','PUT','PATCH','DELETE'], allow_headers=['*'], allow_credentials=False)
 
 @app.middleware('http')
@@ -131,11 +131,11 @@ def opportunity_score(row):
 
 
 @app.get('/health')
-def health(): return {'status':'ok','service':'Lina','version':'11.4.0','mode':'approval-controlled','database_backend':'postgresql' if USE_POSTGRES else 'sqlite','lead_research_configured':bool(BRAVE_SEARCH_API_KEY)}
+def health(): return {'status':'ok','service':'Lina','version':'11.4.2','mode':'approval-controlled','database_backend':'postgresql' if USE_POSTGRES else 'sqlite','lead_research_configured':bool(BRAVE_SEARCH_API_KEY)}
 @app.get('/', include_in_schema=False)
 def home(): return FileResponse(BASE/'static'/'index.html')
 @app.get('/config')
-def config(_:str=Depends(auth)): return {'app_name':APP_NAME,'owner':OWNER,'version':'11.4.0','database_backend':'postgresql' if USE_POSTGRES else 'sqlite','lead_research_configured':bool(BRAVE_SEARCH_API_KEY),'approval_principle':f'Lina prepares/recommends; {OWNER} approves; Lina executes.'}
+def config(_:str=Depends(auth)): return {'app_name':APP_NAME,'owner':OWNER,'version':'11.4.2','database_backend':'postgresql' if USE_POSTGRES else 'sqlite','lead_research_configured':bool(BRAVE_SEARCH_API_KEY),'approval_principle':f'Lina prepares/recommends; {OWNER} approves; Lina executes.'}
 
 @app.get('/dashboard')
 def dashboard(_:str=Depends(auth)):
@@ -329,16 +329,32 @@ def canonical_organization(title, url=''):
     key=organization_key(cleaned)
     return cleaned or clean_search_text(title), key
 
-def potential_product_tracks(solutions):
-    """Research hypotheses only; do not create CRM deals or imply demand."""
+PRODUCT_EVIDENCE = {
+    'AV & Display Solutions': ('interactive display', 'smart classroom', 'digital signage', 'video conferencing', 'lecture hall', 'auditorium', 'av equipment', 'led screen'),
+    'Printing & Document Solutions': ('managed print', 'multifunction printer', 'photocopier', 'print management', 'document scanning', 'printer fleet', 'printing tender'),
+    'Identification Solutions': ('student id card', 'staff id card', 'access card', 'card printer', 'visitor badge', 'identification card'),
+    'Software & Digital Solutions': ('document management system', 'digital archiving', 'workflow automation', 'electronic document', 'erp system', 'digital transformation project'),
+    'Queue Management Systems': ('queue management', 'ticketing kiosk', 'patient queue', 'waiting time system', 'customer service kiosk'),
+}
+
+def potential_product_tracks(solutions, title='', description=''):
+    """Evidence from search text is a research clue, never a verified purchase."""
     next_steps={
-      'AV & Display Solutions':'Check classroom, meeting-room or signage projects and responsible facilities/IT teams.',
-      'Printing & Document Solutions':'Research print fleet, document workflows and procurement contacts.',
-      'Identification Solutions':'Research student/staff ID workflows and the responsible department.',
-      'Software & Digital Solutions':'Research document digitization and workflow improvement initiatives.',
-      'Queue Management Systems':'Research visitor/customer service counters and service-delivery needs.',
+      'AV & Display Solutions':'Ask facilities/IT about classroom, meeting-room and signage upgrade plans.',
+      'Printing & Document Solutions':'Ask procurement about printer fleets, scanning and document workflows.',
+      'Identification Solutions':'Ask administration about student/staff cards and access control.',
+      'Software & Digital Solutions':'Ask IT about archiving, workflows and approved digital projects.',
+      'Queue Management Systems':'Ask operations about visitor flow and service-counter systems.',
     }
-    return [{'solution':v,'status':'POTENTIAL_NEED_UNVERIFIED','next_action':next_steps.get(v,'Research actual requirements with the organization.')} for v in solutions]
+    text=(clean_search_text(title)+' '+clean_search_text(description)).lower()
+    tracks=[]
+    for solution in dict.fromkeys(solutions):
+        matches=[phrase for phrase in PRODUCT_EVIDENCE.get(solution,()) if phrase in text]
+        tracks.append({'solution':solution,
+          'status':'SOURCE_MENTION_UNVERIFIED' if matches else 'SECTOR_FIT_UNVERIFIED',
+          'evidence_terms':matches[:3],
+          'next_action':next_steps.get(solution,'Research actual requirements with the organization.')})
+    return tracks
 
 def solution_fit(industry, title, description, selected=''):
     if selected: return [selected], 'User-selected solution; confirm need with the organization.'
@@ -387,7 +403,7 @@ def classify_result(item):
 
 def brave_search(query,count):
     url='https://api.search.brave.com/res/v1/web/search?'+urllib.parse.urlencode({'q':query,'count':count})
-    req=urllib.request.Request(url,headers={'Accept':'application/json','X-Subscription-Token':BRAVE_SEARCH_API_KEY,'User-Agent':'LinaBusinessAgent/11.4.1'})
+    req=urllib.request.Request(url,headers={'Accept':'application/json','X-Subscription-Token':BRAVE_SEARCH_API_KEY,'User-Agent':'LinaBusinessAgent/11.4.2'})
     try:
         with urllib.request.urlopen(req,timeout=20) as response: payload=json.loads(response.read(750000).decode('utf-8'))
     except urllib.error.HTTPError as e:
@@ -444,7 +460,10 @@ def lead_hunter_search(x:LeadSearch, actor:str=Depends(auth)):
             name,org_key=canonical_organization(row['title'],row['url'])
             row['organization_name']=name
             row['sources']=[{'title':row['title'],'url':row['url'],'description':row['description']}]
-            row['product_tracks']=potential_product_tracks(row['suggested_solutions'])
+            row['product_tracks']=potential_product_tracks(row['suggested_solutions'],row['title'],row['description'])
+            row['evidence_track_count']=sum(t['status']=='SOURCE_MENTION_UNVERIFIED' for t in row['product_tracks'])
+            if row['category']=='POTENTIAL_BUYER':
+                row['lead_score']=min(100,row['lead_score']+min(12,row['evidence_track_count']*4))
             # Group only buyer candidates with a sufficiently distinctive canonical name.
             if row['category']=='POTENTIAL_BUYER' and len(org_key)>=9:
                 if org_key in groups:
@@ -452,20 +471,25 @@ def lead_hunter_search(x:LeadSearch, actor:str=Depends(auth)):
                     target['sources'].append(row['sources'][0])
                     target['lead_score']=max(target['lead_score'],row['lead_score'])
                     for track in row['product_tracks']:
-                        if track['solution'] not in {t['solution'] for t in target['product_tracks']}:
+                        existing_track=next((t for t in target['product_tracks'] if t['solution']==track['solution']),None)
+                        if existing_track is None:
                             target['product_tracks'].append(track)
                             target['suggested_solutions'].append(track['solution'])
+                        elif track['status']=='SOURCE_MENTION_UNVERIFIED':
+                            existing_track['status']='SOURCE_MENTION_UNVERIFIED'
+                            existing_track['evidence_terms']=list(dict.fromkeys(existing_track.get('evidence_terms',[])+track['evidence_terms']))[:3]
+                    target['evidence_track_count']=sum(t['status']=='SOURCE_MENTION_UNVERIFIED' for t in target['product_tracks'])
                     continue
                 groups[org_key]=row
             results.append(row)
     if not results and errors: raise HTTPException(502,'; '.join(errors))
-    results.sort(key=lambda r:(r['category']!='POTENTIAL_BUYER',-r['lead_score']))
+    results.sort(key=lambda r:(r['category']!='POTENTIAL_BUYER',-r.get('evidence_track_count',0),-r['lead_score']))
     results=results[:count]
     c=db(); cur=c.execute('INSERT INTO research_tasks(country,industry,solution,objective,status,created_at) VALUES(?,?,?,?,?,?)',
         (x.country,x.industry,x.solution or 'All MBS Solutions',x.objective.strip() or 'Identify potential buyer organizations', 'COMPLETED' if results else 'NO_RESULTS',now()))
     task_id=cur.lastrowid; audit(c,actor,'WEB_SEARCH','RESEARCH_TASK',task_id,' | '.join(queries)); c.commit(); c.close()
     return {'query':' | '.join(queries),'count':len(results),'results':results,'task_id':task_id,
-        'notice':'One organization may have several potential product tracks; multiple source links are retained. Phone and email are optional. Scores rank search snippets only, not purchase likelihood. No active requirement is verified by this search. Verify organizations and any buying signal at its primary source.'}
+        'notice':'Product evidence is an unverified snippet mention, not a purchase order. One organization may have several potential product tracks; multiple source links are retained. Phone and email are optional. Scores rank search snippets only, not purchase likelihood. No active requirement is verified by this search. Verify organizations and any buying signal at its primary source.'}
 
 # Only fetch public HTTPS pages. Reject internal/reserved IP addresses and redirects.
 def public_host(host):

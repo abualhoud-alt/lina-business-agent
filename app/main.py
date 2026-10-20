@@ -19,7 +19,7 @@ BRAVE_SEARCH_API_KEY = os.getenv('BRAVE_SEARCH_API_KEY', '').strip()
 AUTH_DISABLED = os.getenv('LINA_AUTH_DISABLED', 'false').lower() == 'true'
 ALLOWED_ORIGINS = [x.strip() for x in os.getenv('LINA_ALLOWED_ORIGINS', '*').split(',') if x.strip()]
 
-app = FastAPI(title=APP_NAME, version='11.4.2')
+app = FastAPI(title=APP_NAME, version='11.4.3')
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=['GET','POST','PUT','PATCH','DELETE'], allow_headers=['*'], allow_credentials=False)
 
 @app.middleware('http')
@@ -131,11 +131,11 @@ def opportunity_score(row):
 
 
 @app.get('/health')
-def health(): return {'status':'ok','service':'Lina','version':'11.4.2','mode':'approval-controlled','database_backend':'postgresql' if USE_POSTGRES else 'sqlite','lead_research_configured':bool(BRAVE_SEARCH_API_KEY)}
+def health(): return {'status':'ok','service':'Lina','version':'11.4.3','mode':'approval-controlled','database_backend':'postgresql' if USE_POSTGRES else 'sqlite','lead_research_configured':bool(BRAVE_SEARCH_API_KEY)}
 @app.get('/', include_in_schema=False)
 def home(): return FileResponse(BASE/'static'/'index.html')
 @app.get('/config')
-def config(_:str=Depends(auth)): return {'app_name':APP_NAME,'owner':OWNER,'version':'11.4.2','database_backend':'postgresql' if USE_POSTGRES else 'sqlite','lead_research_configured':bool(BRAVE_SEARCH_API_KEY),'approval_principle':f'Lina prepares/recommends; {OWNER} approves; Lina executes.'}
+def config(_:str=Depends(auth)): return {'app_name':APP_NAME,'owner':OWNER,'version':'11.4.3','database_backend':'postgresql' if USE_POSTGRES else 'sqlite','lead_research_configured':bool(BRAVE_SEARCH_API_KEY),'approval_principle':f'Lina prepares/recommends; {OWNER} approves; Lina executes.'}
 
 @app.get('/dashboard')
 def dashboard(_:str=Depends(auth)):
@@ -213,6 +213,8 @@ def complete_activity(item_id:int, actor:str=Depends(auth)):
 def create_quote(x:Quote, actor:str=Depends(auth)):
     c=db();
     if not c.execute('SELECT 1 FROM companies WHERE id=?',(x.company_id,)).fetchone(): c.close(); raise HTTPException(400,'company not found')
+    if x.selling_price <= 0: c.close(); raise HTTPException(400,'Enter a fresh, positive selling price approved for this quotation.')
+    if x.cost < 0 or x.discount < 0 or x.discount >= x.selling_price or not 0 <= x.vat <= 100: c.close(); raise HTTPException(400,'Invalid quotation amounts or VAT.')
     subtotal=max(0,x.selling_price-x.discount); total=round(subtotal*(1+x.vat/100),2)
     quote_no=x.quote_no.strip() or f'MBS-{datetime.now().strftime("%Y%m%d")}-{c.execute("SELECT COUNT(*) n FROM quotations").fetchone()["n"]+1:04d}'
     cur=c.execute('INSERT INTO quotations(company_id,opportunity_id,quote_no,items_json,cost,selling_price,discount,vat,total,payment_terms,delivery,warranty,validity_days,approval_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(x.company_id,x.opportunity_id,quote_no,json.dumps(x.items),x.cost,x.selling_price,x.discount,x.vat,total,x.payment_terms,x.delivery,x.warranty,x.validity_days,'PENDING_APPROVAL',now()))
@@ -373,37 +375,63 @@ def solution_fit(industry, title, description, selected=''):
             return solutions, 'Sector-based possible fit, not evidence of a current purchase requirement.'
     return ['Printing & Document Solutions','Software & Digital Solutions'], 'General office possibilities; verify customer operations and needs.'
 
+# Tender portal results are research sources, not automatically MBS customers.
+PORTAL_HOST_HINTS = ('tenderboard.gov.om', 'etendering.', 'tendersinfo.', 'omantenders.', 'tenderdetail.')
+PORTAL_TITLE_HINTS = ('oman tenders', 'tender portal', 'tender board', 'tender listing',
+    'tenders database', 'etendering portal', 'e-tendering portal', 'latest tenders')
+TENDER_NOTICE_HINTS = ('tender no.', 'tender number', 'tender reference', 'bid closing',
+    'closing date', 'submission deadline', 'invitation to tender', 'tender id')
+ACCESS_HINTS = ('register to view', 'login to view', 'sign in to view',
+    'purchase tender documents', 'buy tender documents', 'registered suppliers only',
+    'supplier registration required')
+
 def classify_result(item):
     title=clean_search_text(item.get('title',''))
     desc=clean_search_text(item.get('description',''))
     blob=(title+' '+desc).lower()
     domain=(urllib.parse.urlsplit(item.get('url','')).hostname or '').lower()
+    portal=(any(t in domain for t in PORTAL_HOST_HINTS) or
+            any(t in title.lower() for t in PORTAL_TITLE_HINTS))
     directory=any(t in blob or t in domain for t in DIRECTORY_MARKERS)
     supplier=any(t in blob for t in SUPPLIER_MARKERS)
     buyer_title=any(t in title.lower() for t in BUYER_MARKERS)
     buyer=buyer_title or any(t in blob for t in BUYER_MARKERS)
     signals=[t for t in SIGNAL_MARKERS if t in blob]
-    if directory: category='DIRECTORY_OR_AGGREGATOR'
+    notice=any(t in blob for t in TENDER_NOTICE_HINTS)
+    access=any(t in blob for t in ACCESS_HINTS)
+    if portal: category='TENDER_RESEARCH_PORTAL'
+    elif directory: category='DIRECTORY_OR_AGGREGATOR'
     elif supplier and not buyer_title: category='SUPPLIER_OR_COMPETITOR'
+    elif notice: category='POSSIBLE_TENDER_NOTICE'
     elif buyer: category='POTENTIAL_BUYER'
     else: category='UNCLASSIFIED'
-    # Search relevance is not purchase likelihood; signals in snippets remain unverified.
-    score=(40 if category=='POTENTIAL_BUYER' else 8 if directory or supplier else 18)
     if category=='POTENTIAL_BUYER':
-        score+=12 if buyer_title else 3
-        score+=min(9, len(signals)*3)
+        score=40+(12 if buyer_title else 3)+min(9,len(signals)*3)
         if domain.endswith(('.edu.om','.gov.om','.ac.om')): score+=8
-        if any(t in domain for t in ('directory','tendersinfo','yellowpages')): score-=20
-    score=max(0,min(100,score))
-    return {'category':category,'lead_score':score,'score_type':'SEARCH_RANKING_HEURISTIC','buying_signals':signals,
-            'opportunity_type':'POTENTIAL_CUSTOMER' if category=='POTENTIAL_BUYER' else 'RESEARCH_SOURCE',
-            'buying_requirement_verified':False, 'contact_status':'NOT_RESEARCHED',
-            'next_action':'Verify official organization website and research IT/procurement contacts; phone and email are optional.' if category=='POTENTIAL_BUYER' else 'Confirm this source represents a buyer rather than a supplier or listing.',
-            'qualification_note':'Unverified prospect. Search signals do not establish an active tender or purchasing requirement.'}
+    elif category=='POSSIBLE_TENDER_NOTICE': score=35+min(12,len(signals)*3)
+    else: score=8 if category in ('TENDER_RESEARCH_PORTAL','DIRECTORY_OR_AGGREGATOR','SUPPLIER_OR_COMPETITOR') else 18
+    status=('REGISTRATION_MAY_BE_REQUIRED' if access else
+            'POSSIBLE_NOTICE_UNVERIFIED' if notice else
+            'PORTAL_OR_GENERAL_PAGE' if portal else 'NO_PUBLIC_NOTICE_IDENTIFIED')
+    if category=='POTENTIAL_BUYER':
+        action='Verify buyer identity and research procurement contacts; no active tender is established.'
+    elif category=='POSSIBLE_TENDER_NOTICE':
+        action='Open the original notice; verify reference, requirements, closing date and portal access.'
+    elif category=='TENDER_RESEARCH_PORTAL':
+        action='Use as a tender research portal; registered MBS access may be needed. Do not save portal as a CRM customer.'
+    else:
+        action='Verify whether this is a real buyer, a listing or a research source.'
+    return {'category':category,'lead_score':max(0,min(100,score)),
+        'score_type':'SEARCH_RANKING_HEURISTIC','buying_signals':signals,
+        'opportunity_type':('POTENTIAL_CUSTOMER' if category=='POTENTIAL_BUYER' else
+                            'POSSIBLE_TENDER_UNVERIFIED' if category=='POSSIBLE_TENDER_NOTICE' else 'RESEARCH_SOURCE'),
+        'tender_access_status':status,'buying_requirement_verified':False,
+        'contact_status':'NOT_RESEARCHED','next_action':action,
+        'qualification_note':'Search snippet only. No tender document, requirement, purchase or deadline has been verified.'}
 
 def brave_search(query,count):
     url='https://api.search.brave.com/res/v1/web/search?'+urllib.parse.urlencode({'q':query,'count':count})
-    req=urllib.request.Request(url,headers={'Accept':'application/json','X-Subscription-Token':BRAVE_SEARCH_API_KEY,'User-Agent':'LinaBusinessAgent/11.4.2'})
+    req=urllib.request.Request(url,headers={'Accept':'application/json','X-Subscription-Token':BRAVE_SEARCH_API_KEY,'User-Agent':'LinaBusinessAgent/11.4.3'})
     try:
         with urllib.request.urlopen(req,timeout=20) as response: payload=json.loads(response.read(750000).decode('utf-8'))
     except urllib.error.HTTPError as e:
@@ -460,7 +488,7 @@ def lead_hunter_search(x:LeadSearch, actor:str=Depends(auth)):
             name,org_key=canonical_organization(row['title'],row['url'])
             row['organization_name']=name
             row['sources']=[{'title':row['title'],'url':row['url'],'description':row['description']}]
-            row['product_tracks']=potential_product_tracks(row['suggested_solutions'],row['title'],row['description'])
+            row['product_tracks']=potential_product_tracks(row['suggested_solutions'],row['title'],row['description']) if row['category']=='POTENTIAL_BUYER' else []
             row['evidence_track_count']=sum(t['status']=='SOURCE_MENTION_UNVERIFIED' for t in row['product_tracks'])
             if row['category']=='POTENTIAL_BUYER':
                 row['lead_score']=min(100,row['lead_score']+min(12,row['evidence_track_count']*4))
@@ -489,7 +517,7 @@ def lead_hunter_search(x:LeadSearch, actor:str=Depends(auth)):
         (x.country,x.industry,x.solution or 'All MBS Solutions',x.objective.strip() or 'Identify potential buyer organizations', 'COMPLETED' if results else 'NO_RESULTS',now()))
     task_id=cur.lastrowid; audit(c,actor,'WEB_SEARCH','RESEARCH_TASK',task_id,' | '.join(queries)); c.commit(); c.close()
     return {'query':' | '.join(queries),'count':len(results),'results':results,'task_id':task_id,
-        'notice':'Product evidence is an unverified snippet mention, not a purchase order. One organization may have several potential product tracks; multiple source links are retained. Phone and email are optional. Scores rank search snippets only, not purchase likelihood. No active requirement is verified by this search. Verify organizations and any buying signal at its primary source.'}
+        'notice':'Tender portals and general ministry pages are not verified tenders. Restricted-access tenders may exist without public details. Product evidence is an unverified snippet mention, not a purchase order. One organization may have several potential product tracks; multiple source links are retained. Phone and email are optional. Scores rank search snippets only, not purchase likelihood. No active requirement is verified by this search. Verify organizations and any buying signal at its primary source.'}
 
 # Only fetch public HTTPS pages. Reject internal/reserved IP addresses and redirects.
 def public_host(host):

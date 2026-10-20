@@ -19,7 +19,7 @@ BRAVE_SEARCH_API_KEY = os.getenv('BRAVE_SEARCH_API_KEY', '').strip()
 AUTH_DISABLED = os.getenv('LINA_AUTH_DISABLED', 'false').lower() == 'true'
 ALLOWED_ORIGINS = [x.strip() for x in os.getenv('LINA_ALLOWED_ORIGINS', '*').split(',') if x.strip()]
 
-app = FastAPI(title=APP_NAME, version='11.3.3')
+app = FastAPI(title=APP_NAME, version='11.4.0')
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=['GET','POST','PUT','PATCH','DELETE'], allow_headers=['*'], allow_credentials=False)
 
 @app.middleware('http')
@@ -131,11 +131,11 @@ def opportunity_score(row):
 
 
 @app.get('/health')
-def health(): return {'status':'ok','service':'Lina','version':'11.3.3','mode':'approval-controlled','database_backend':'postgresql' if USE_POSTGRES else 'sqlite','lead_research_configured':bool(BRAVE_SEARCH_API_KEY)}
+def health(): return {'status':'ok','service':'Lina','version':'11.4.0','mode':'approval-controlled','database_backend':'postgresql' if USE_POSTGRES else 'sqlite','lead_research_configured':bool(BRAVE_SEARCH_API_KEY)}
 @app.get('/', include_in_schema=False)
 def home(): return FileResponse(BASE/'static'/'index.html')
 @app.get('/config')
-def config(_:str=Depends(auth)): return {'app_name':APP_NAME,'owner':OWNER,'version':'11.3.3','database_backend':'postgresql' if USE_POSTGRES else 'sqlite','lead_research_configured':bool(BRAVE_SEARCH_API_KEY),'approval_principle':f'Lina prepares/recommends; {OWNER} approves; Lina executes.'}
+def config(_:str=Depends(auth)): return {'app_name':APP_NAME,'owner':OWNER,'version':'11.4.0','database_backend':'postgresql' if USE_POSTGRES else 'sqlite','lead_research_configured':bool(BRAVE_SEARCH_API_KEY),'approval_principle':f'Lina prepares/recommends; {OWNER} approves; Lina executes.'}
 
 @app.get('/dashboard')
 def dashboard(_:str=Depends(auth)):
@@ -299,31 +299,69 @@ BUYER_MARKERS = ('school', 'university', 'college', 'academy', 'campus', 'hospit
 SIGNAL_MARKERS = ('tender', 'rfp', 'request for proposal', 'procurement notice',
     'invitation to bid', 'request for quotation', 'expansion project', 'new campus')
 
+def clean_search_text(value):
+    """Remove markup supplied by search snippets before displaying or ranking."""
+    return ' '.join(html.unescape(re.sub(r'<[^>]*>', ' ', str(value or ''))).split())
+
+def organization_key(title):
+    """Conservative title-based dedupe; avoid merging unrelated organizations."""
+    title=clean_search_text(title).lower()
+    title=title.strip(' :|-')
+    title=re.sub(r'^(?:welcome to|home|official website of)\s+', '', title)
+    title=re.split(r'\s+[|–—]\s+|\s+::\s+', title)[0]
+    title=re.sub(r'\s*[-:]\s*(?:sultanate of )?oman\s*$', '', title)
+    title=re.sub(r'\s+(?:sultanate of )?oman$', '', title)
+    title=re.sub(r'[^a-z0-9\u0600-\u06ff ]+', ' ', title)
+    return ' '.join(title.split())
+
+def solution_fit(industry, title, description, selected=''):
+    if selected: return [selected], 'User-selected solution; confirm need with the organization.'
+    blob=(industry+' '+title+' '+description).lower()
+    mapping=[
+        (('school','university','college','academy','education','campus','student'), ['AV & Display Solutions','Printing & Document Solutions','Identification Solutions']),
+        (('hospital','clinic','healthcare','medical','patient'), ['Queue Management Systems','Printing & Document Solutions','Software & Digital Solutions']),
+        (('ministry','municipality','government','authority','public service'), ['Queue Management Systems','Software & Digital Solutions','Printing & Document Solutions']),
+        (('hotel','resort','hospitality'), ['AV & Display Solutions','Software & Digital Solutions']),
+        (('bank','finance','branch'), ['Queue Management Systems','Software & Digital Solutions','Printing & Document Solutions']),
+        (('factory','manufacturing','industrial'), ['Identification Solutions','Software & Digital Solutions']),
+        (('retail','shopping mall','supermarket'), ['AV & Display Solutions','Queue Management Systems']),
+    ]
+    for markers,solutions in mapping:
+        if any(marker in blob for marker in markers):
+            return solutions, 'Sector-based possible fit, not evidence of a current purchase requirement.'
+    return ['Printing & Document Solutions','Software & Digital Solutions'], 'General office possibilities; verify customer operations and needs.'
+
 def classify_result(item):
-    title=item.get('title','') or ''
-    desc=item.get('description','') or ''
+    title=clean_search_text(item.get('title',''))
+    desc=clean_search_text(item.get('description',''))
     blob=(title+' '+desc).lower()
     domain=(urllib.parse.urlsplit(item.get('url','')).hostname or '').lower()
     directory=any(t in blob or t in domain for t in DIRECTORY_MARKERS)
     supplier=any(t in blob for t in SUPPLIER_MARKERS)
-    buyer=any(t in blob for t in BUYER_MARKERS)
+    buyer_title=any(t in title.lower() for t in BUYER_MARKERS)
+    buyer=buyer_title or any(t in blob for t in BUYER_MARKERS)
     signals=[t for t in SIGNAL_MARKERS if t in blob]
     if directory: category='DIRECTORY_OR_AGGREGATOR'
-    elif supplier: category='SUPPLIER_OR_COMPETITOR'
+    elif supplier and not buyer_title: category='SUPPLIER_OR_COMPETITOR'
     elif buyer: category='POTENTIAL_BUYER'
     else: category='UNCLASSIFIED'
-    # Ranking heuristic only. A search snippet cannot verify purchasing intent.
-    score=(50 if category=='POTENTIAL_BUYER' else 5 if supplier or directory else 20) + (10 if signals and category=='POTENTIAL_BUYER' else 0)
+    # Search relevance is not purchase likelihood; signals in snippets remain unverified.
+    score=(40 if category=='POTENTIAL_BUYER' else 8 if directory or supplier else 18)
+    if category=='POTENTIAL_BUYER':
+        score+=12 if buyer_title else 3
+        score+=min(9, len(signals)*3)
+        if domain.endswith(('.edu.om','.gov.om','.ac.om')): score+=8
+        if any(t in domain for t in ('directory','tendersinfo','yellowpages')): score-=20
+    score=max(0,min(100,score))
     return {'category':category,'lead_score':score,'score_type':'SEARCH_RANKING_HEURISTIC','buying_signals':signals,
             'opportunity_type':'POTENTIAL_CUSTOMER' if category=='POTENTIAL_BUYER' else 'RESEARCH_SOURCE',
-            'buying_requirement_verified':False,
-            'contact_status':'NOT_RESEARCHED',
-            'next_action':'Verify organization and official website; research procurement/IT contacts. Keep lead even without contact details.' if category=='POTENTIAL_BUYER' else 'Verify this is a real buyer organization before saving.',
-            'qualification_note':'Preliminary keyword-based classification, not a verified buying requirement.'}
+            'buying_requirement_verified':False, 'contact_status':'NOT_RESEARCHED',
+            'next_action':'Verify official organization website and research IT/procurement contacts; phone and email are optional.' if category=='POTENTIAL_BUYER' else 'Confirm this source represents a buyer rather than a supplier or listing.',
+            'qualification_note':'Unverified prospect. Search signals do not establish an active tender or purchasing requirement.'}
 
 def brave_search(query,count):
     url='https://api.search.brave.com/res/v1/web/search?'+urllib.parse.urlencode({'q':query,'count':count})
-    req=urllib.request.Request(url,headers={'Accept':'application/json','X-Subscription-Token':BRAVE_SEARCH_API_KEY,'User-Agent':'LinaBusinessAgent/11.3.1'})
+    req=urllib.request.Request(url,headers={'Accept':'application/json','X-Subscription-Token':BRAVE_SEARCH_API_KEY,'User-Agent':'LinaBusinessAgent/11.4.0'})
     try:
         with urllib.request.urlopen(req,timeout=20) as response: payload=json.loads(response.read(750000).decode('utf-8'))
     except urllib.error.HTTPError as e:
@@ -360,7 +398,7 @@ def lead_hunter_search(x:LeadSearch, actor:str=Depends(auth)):
         queries.append(f'{buyers} {x.country.strip()} organizations institutions new branches official website')
     # Limit queries to control API usage and preserve relevance.
     queries=queries[:3]
-    results=[]; seen=set(); errors=[]
+    results=[]; seen=set(); seen_organizations=set(); errors=[]
     per_query=min(20,max(count,8))
     for query in queries:
         try: raw=brave_search(query,per_query)
@@ -373,15 +411,14 @@ def lead_hunter_search(x:LeadSearch, actor:str=Depends(auth)):
             key=(parsed.hostname.lower().removeprefix('www.'),parsed.path.rstrip('/').lower())
             if key in seen: continue
             seen.add(key)
-            row={'title':item.get('title',''),'url':link,'description':item.get('description',''),
+            row={'title':clean_search_text(item.get('title','')),'url':link,'description':clean_search_text(item.get('description','')),
                  'source':'Brave Search','verification_status':'UNVERIFIED'}
             row.update(classify_result(row))
-            if all_portfolio:
-                row['suggested_solutions']=list(MBS_SOLUTIONS)
-                row['solution_note']='Portfolio possibilities only; confirm fit before proposing.'
-            else:
-                row['suggested_solutions']=[x.solution.strip()]
-                row['solution_note']='User-selected solution; fit not yet confirmed.'
+            row['suggested_solutions'],row['solution_note']=solution_fit(x.industry,row['title'],row['description'],'' if all_portfolio else x.solution.strip())
+            org_key=organization_key(row['title'])
+            if row['category']=='POTENTIAL_BUYER' and len(org_key)>=8:
+                if org_key in seen_organizations: continue
+                seen_organizations.add(org_key)
             results.append(row)
     if not results and errors: raise HTTPException(502,'; '.join(errors))
     results.sort(key=lambda r:(r['category']!='POTENTIAL_BUYER',-r['lead_score']))
@@ -390,7 +427,7 @@ def lead_hunter_search(x:LeadSearch, actor:str=Depends(auth)):
         (x.country,x.industry,x.solution or 'All MBS Solutions',x.objective.strip() or 'Identify potential buyer organizations', 'COMPLETED' if results else 'NO_RESULTS',now()))
     task_id=cur.lastrowid; audit(c,actor,'WEB_SEARCH','RESEARCH_TASK',task_id,' | '.join(queries)); c.commit(); c.close()
     return {'query':' | '.join(queries),'count':len(results),'results':results,'task_id':task_id,
-        'notice':'Phone and email are optional. Scores rank search snippets only, not purchase likelihood. No active requirement is verified by this search. Verify organizations and any buying signal at its primary source.'}
+        'notice':'Organizations are grouped conservatively by name. Phone and email are optional. Scores rank search snippets only, not purchase likelihood. No active requirement is verified by this search. Verify organizations and any buying signal at its primary source.'}
 
 # Only fetch public HTTPS pages. Reject internal/reserved IP addresses and redirects.
 def public_host(host):

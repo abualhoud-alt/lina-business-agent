@@ -19,7 +19,7 @@ BRAVE_SEARCH_API_KEY = os.getenv('BRAVE_SEARCH_API_KEY', '').strip()
 AUTH_DISABLED = os.getenv('LINA_AUTH_DISABLED', 'false').lower() == 'true'
 ALLOWED_ORIGINS = [x.strip() for x in os.getenv('LINA_ALLOWED_ORIGINS', '*').split(',') if x.strip()]
 
-app = FastAPI(title=APP_NAME, version='11.4.0')
+app = FastAPI(title=APP_NAME, version='11.4.1')
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=['GET','POST','PUT','PATCH','DELETE'], allow_headers=['*'], allow_credentials=False)
 
 @app.middleware('http')
@@ -314,6 +314,32 @@ def organization_key(title):
     title=re.sub(r'[^a-z0-9\u0600-\u06ff ]+', ' ', title)
     return ' '.join(title.split())
 
+def canonical_organization(title, url=''):
+    """Conservative organization grouping. Aliases must be explicit, not fuzzy guesses."""
+    cleaned=clean_search_text(title)
+    low=cleaned.lower()
+    host=(urllib.parse.urlsplit(url).hostname or '').lower().removeprefix('www.')
+    if ('sultan qaboos university' in low or re.search(r'\bsqu\b',low)) and ('university' in low or host=='squ.edu.om'):
+        return 'Sultan Qaboos University', 'sultan qaboos university'
+    # Known prefixes in search titles are not necessarily part of an institution's name.
+    cleaned=re.sub(r'^(?:oman\s*[-–:]\s*)', '', cleaned, flags=re.I)
+    cleaned=re.sub(r'^(?:homepage\s*[-–:]\s*)', '', cleaned, flags=re.I)
+    cleaned=re.split(r'\s+[|–—]\s+|\s+::\s+',cleaned)[0].strip()
+    cleaned=re.sub(r'\s*[-:]\s*(?:sultanate of )?oman\s*$', '', cleaned, flags=re.I).strip()
+    key=organization_key(cleaned)
+    return cleaned or clean_search_text(title), key
+
+def potential_product_tracks(solutions):
+    """Research hypotheses only; do not create CRM deals or imply demand."""
+    next_steps={
+      'AV & Display Solutions':'Check classroom, meeting-room or signage projects and responsible facilities/IT teams.',
+      'Printing & Document Solutions':'Research print fleet, document workflows and procurement contacts.',
+      'Identification Solutions':'Research student/staff ID workflows and the responsible department.',
+      'Software & Digital Solutions':'Research document digitization and workflow improvement initiatives.',
+      'Queue Management Systems':'Research visitor/customer service counters and service-delivery needs.',
+    }
+    return [{'solution':v,'status':'POTENTIAL_NEED_UNVERIFIED','next_action':next_steps.get(v,'Research actual requirements with the organization.')} for v in solutions]
+
 def solution_fit(industry, title, description, selected=''):
     if selected: return [selected], 'User-selected solution; confirm need with the organization.'
     blob=(industry+' '+title+' '+description).lower()
@@ -361,7 +387,7 @@ def classify_result(item):
 
 def brave_search(query,count):
     url='https://api.search.brave.com/res/v1/web/search?'+urllib.parse.urlencode({'q':query,'count':count})
-    req=urllib.request.Request(url,headers={'Accept':'application/json','X-Subscription-Token':BRAVE_SEARCH_API_KEY,'User-Agent':'LinaBusinessAgent/11.4.0'})
+    req=urllib.request.Request(url,headers={'Accept':'application/json','X-Subscription-Token':BRAVE_SEARCH_API_KEY,'User-Agent':'LinaBusinessAgent/11.4.1'})
     try:
         with urllib.request.urlopen(req,timeout=20) as response: payload=json.loads(response.read(750000).decode('utf-8'))
     except urllib.error.HTTPError as e:
@@ -398,7 +424,7 @@ def lead_hunter_search(x:LeadSearch, actor:str=Depends(auth)):
         queries.append(f'{buyers} {x.country.strip()} organizations institutions new branches official website')
     # Limit queries to control API usage and preserve relevance.
     queries=queries[:3]
-    results=[]; seen=set(); seen_organizations=set(); errors=[]
+    results=[]; seen=set(); groups={}; errors=[]
     per_query=min(20,max(count,8))
     for query in queries:
         try: raw=brave_search(query,per_query)
@@ -415,10 +441,22 @@ def lead_hunter_search(x:LeadSearch, actor:str=Depends(auth)):
                  'source':'Brave Search','verification_status':'UNVERIFIED'}
             row.update(classify_result(row))
             row['suggested_solutions'],row['solution_note']=solution_fit(x.industry,row['title'],row['description'],'' if all_portfolio else x.solution.strip())
-            org_key=organization_key(row['title'])
-            if row['category']=='POTENTIAL_BUYER' and len(org_key)>=8:
-                if org_key in seen_organizations: continue
-                seen_organizations.add(org_key)
+            name,org_key=canonical_organization(row['title'],row['url'])
+            row['organization_name']=name
+            row['sources']=[{'title':row['title'],'url':row['url'],'description':row['description']}]
+            row['product_tracks']=potential_product_tracks(row['suggested_solutions'])
+            # Group only buyer candidates with a sufficiently distinctive canonical name.
+            if row['category']=='POTENTIAL_BUYER' and len(org_key)>=9:
+                if org_key in groups:
+                    target=groups[org_key]
+                    target['sources'].append(row['sources'][0])
+                    target['lead_score']=max(target['lead_score'],row['lead_score'])
+                    for track in row['product_tracks']:
+                        if track['solution'] not in {t['solution'] for t in target['product_tracks']}:
+                            target['product_tracks'].append(track)
+                            target['suggested_solutions'].append(track['solution'])
+                    continue
+                groups[org_key]=row
             results.append(row)
     if not results and errors: raise HTTPException(502,'; '.join(errors))
     results.sort(key=lambda r:(r['category']!='POTENTIAL_BUYER',-r['lead_score']))
@@ -427,7 +465,7 @@ def lead_hunter_search(x:LeadSearch, actor:str=Depends(auth)):
         (x.country,x.industry,x.solution or 'All MBS Solutions',x.objective.strip() or 'Identify potential buyer organizations', 'COMPLETED' if results else 'NO_RESULTS',now()))
     task_id=cur.lastrowid; audit(c,actor,'WEB_SEARCH','RESEARCH_TASK',task_id,' | '.join(queries)); c.commit(); c.close()
     return {'query':' | '.join(queries),'count':len(results),'results':results,'task_id':task_id,
-        'notice':'Organizations are grouped conservatively by name. Phone and email are optional. Scores rank search snippets only, not purchase likelihood. No active requirement is verified by this search. Verify organizations and any buying signal at its primary source.'}
+        'notice':'One organization may have several potential product tracks; multiple source links are retained. Phone and email are optional. Scores rank search snippets only, not purchase likelihood. No active requirement is verified by this search. Verify organizations and any buying signal at its primary source.'}
 
 # Only fetch public HTTPS pages. Reject internal/reserved IP addresses and redirects.
 def public_host(host):

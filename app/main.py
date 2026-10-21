@@ -440,6 +440,51 @@ def brave_search(query,count):
         raise HTTPException(502,'Web search failed to respond. Please retry later.')
     return payload.get('web',{}).get('results',[])
 
+
+# V11.4.4: Tender research is separate from CRM lead discovery.
+class TenderSearch(BaseModel):
+    country:str='Oman'
+    sector:str='Government'
+    keywords:str=''
+    count:int=10
+
+@app.post('/tender-hunter/search')
+def tender_hunter_search(x:TenderSearch, actor:str=Depends(auth)):
+    if not BRAVE_SEARCH_API_KEY:
+        raise HTTPException(503,'Configure BRAVE_SEARCH_API_KEY in Render Environment.')
+    country=x.country.strip()
+    if not country or len(country)>80:
+        raise HTTPException(400,'Enter a valid country.')
+    sector=x.sector.strip().lower()
+    if sector not in ('government','private'):
+        raise HTTPException(400,'Sector must be Government or Private.')
+    count=max(1,min(x.count,20))
+    terms=' '.join(x.keywords.split()[:12])[:140]
+    kind=('government ministry public procurement' if sector=='government' else 'private company corporate RFQ procurement')
+    queries=[f'{country} {kind} tender notice {terms}',f'{country} {kind} request for quotation tender {terms}']
+    found=[];seen=set();errors=[]
+    for query in queries:
+        try: hits=brave_search(query,min(20,max(8,count)))
+        except HTTPException as exc:
+            errors.append(str(exc.detail));continue
+        for hit in hits:
+            url=hit.get('url','')
+            parsed=urllib.parse.urlsplit(url)
+            if parsed.scheme!='https' or not parsed.hostname:continue
+            key=(parsed.hostname.lower(),parsed.path.rstrip('/').lower())
+            if key in seen:continue
+            seen.add(key)
+            row={'title':clean_search_text(hit.get('title','')),'description':clean_search_text(hit.get('description','')),'url':url}
+            row.update(classify_result(row))
+            # Search snippets are never a verified tender, regardless of keyword matches.
+            row['verified']=False
+            row['research_kind']='POSSIBLE_NOTICE' if row['category']=='POSSIBLE_TENDER_NOTICE' else 'PORTAL_OR_GENERAL_SOURCE'
+            row['next_action']='Open official source and check reference, scope, deadline and registered-supplier access.'
+            found.append(row)
+    if not found and errors:raise HTTPException(502,'; '.join(errors))
+    found.sort(key=lambda r:(r['research_kind']!='POSSIBLE_NOTICE',-r['lead_score']))
+    return {'results':found[:count],'count':min(count,len(found)), 'notice':'Research only. Search results do not verify a tender or deadline. Registration and payment may be required; never purchase or submit automatically.'}
+
 @app.get('/lead-hunter/portfolio')
 def lead_portfolio(_:str=Depends(auth)):
     return {'solutions':list(MBS_SOLUTIONS),'note':'All MBS solutions can be researched. Results are candidates, not confirmed demand.'}

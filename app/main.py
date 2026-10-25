@@ -19,7 +19,7 @@ BRAVE_SEARCH_API_KEY = os.getenv('BRAVE_SEARCH_API_KEY', '').strip()
 AUTH_DISABLED = os.getenv('LINA_AUTH_DISABLED', 'false').lower() == 'true'
 ALLOWED_ORIGINS = [x.strip() for x in os.getenv('LINA_ALLOWED_ORIGINS', '*').split(',') if x.strip()]
 
-app = FastAPI(title=APP_NAME, version='11.4.5')
+app = FastAPI(title=APP_NAME, version='11.4.6')
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=['GET','POST','PUT','PATCH','DELETE'], allow_headers=['*'], allow_credentials=False)
 
 @app.middleware('http')
@@ -440,6 +440,77 @@ def brave_search(query,count):
         raise HTTPException(502,'Web search failed to respond. Please retry later.')
     return payload.get('web',{}).get('results',[])
 
+
+
+# V11.4.6 experimental public ESNAD listing reader.
+# Only official, fixed host; no supplier credentials, payments, or submissions.
+ESNAD_PUBLIC_URL = 'https://etendering.tenderboard.gov.om/product/publicDash?viewFlag=NewTenders'
+MBS_TENDER_TERMS = {
+ 'Displays / AV': ('display','screen','projector','audio','visual','conference','microphone','speaker','video wall','smart board','interactive','شاشة','شاشات','عرض','صوت','مرئي','بروجكتور','سبورة'),
+ 'Printing / Documents': ('printer','printing','copier','photocopier','scanner','print management','binding','طابعة','طابعات','طباعة','تصوير','ماسح','مستندات'),
+ 'Software / Digital': ('software','licenses','licence','digital signage','information technology','document management','application','برنامج','برامج','تراخيص','تقنية المعلومات','نظام إلكتروني'),
+ 'Queue / Identification': ('queue','ticketing','visitor management','id card','identification','biometric','انتظار','طابور','بطاقات','هوية','بصمة'),
+}
+
+def parse_esnad_public_table(markup):
+    from bs4 import BeautifulSoup
+    soup=BeautifulSoup(markup,'html.parser')
+    records=[]
+    for tr in soup.select('tr'):
+        cols=tr.find_all('td',recursive=False)
+        if len(cols)<7: continue
+        values=[c.get_text(' ',strip=True) for c in cols]
+        # The public table typically starts: serial, reference, title, buyer,
+        # procurement category, tender type, dates, fee, guarantee, action.
+        if not re.match(r'^\d+[.]?$',values[0]):continue
+        if len(values)<8:continue
+        ref,title,buyer=values[1:4]
+        if not ref or not title or not buyer:continue
+        date_cell=' '.join(values[6:8])
+        purchase=re.search(r'Sales\s*End\s*Date\s*:\s*(\d{2}[-/]\d{2}[-/]\d{4})',date_cell,re.I)
+        closing=re.search(r'Bid\s*Closing\s*Date\s*:\s*(\d{2}[-/]\d{2}[-/]\d{4})',date_cell,re.I)
+        if not (purchase or closing):continue
+        title_words=title.casefold()
+        matches=[name for name,terms in MBS_TENDER_TERMS.items() if any(term in title_words for term in terms)]
+        tender_type=values[5]
+        records.append({'tender_reference':ref,'title':title,'buyer':buyer,
+          'procurement_category':values[4],'tender_type':tender_type,
+          'sme_designated':('الصغيرة' in tender_type or 'SME' in tender_type.upper()),
+          'purchase_deadline':purchase.group(1) if purchase else 'NOT_AVAILABLE',
+          'closing_deadline':closing.group(1) if closing else 'NOT_AVAILABLE',
+          'tender_fee':values[7] if len(values)>7 else 'NOT_AVAILABLE',
+          'matched_portfolios':matches,'eligibility':'NOT_VERIFIED',
+          'source_url':ESNAD_PUBLIC_URL,'source_type':'OFFICIAL_ESNAD_PUBLIC_TABLE'})
+    return records
+
+@app.get('/tender-hunter/esnad-public')
+def esnad_public_tenders(actor:str=Depends(auth)):
+    request=urllib.request.Request(ESNAD_PUBLIC_URL,headers={
+      'User-Agent':'Mozilla/5.0 (compatible; MBS-LinaTenderResearch/11.4.6)',
+      'Accept':'text/html,application/xhtml+xml','Accept-Language':'en,ar;q=0.8'})
+    try:
+        with urllib.request.urlopen(request,timeout=18) as response:
+            final=urllib.parse.urlsplit(response.geturl())
+            if final.scheme!='https' or final.hostname!='etendering.tenderboard.gov.om':
+                raise ValueError('Unexpected redirect outside official ESNAD host')
+            body=response.read(3_000_001)
+            if len(body)>3_000_000:raise ValueError('ESNAD response too large')
+            content_type=response.headers.get('Content-Type','')
+            charset=response.headers.get_content_charset() or 'utf-8'
+            markup=body.decode(charset,errors='replace')
+        rows=parse_esnad_public_table(markup)
+    except Exception as exc:
+        return {'status':'UNAVAILABLE','checked_at':now(),'source_url':ESNAD_PUBLIC_URL,
+         'notice':'Live ESNAD table could not be read. No tender information was invented. Please use the official portal.',
+         'error_type':type(exc).__name__,'results':[],'scanned_count':0,'coverage':'NOT_VERIFIED'}
+    if not rows:
+        return {'status':'UNVERIFIED_FORMAT','checked_at':now(),'source_url':ESNAD_PUBLIC_URL,
+         'notice':'The ESNAD page was reached, but no recognizable tender rows were found. The portal layout or access method may have changed.',
+         'results':[],'scanned_count':0,'coverage':'NOT_VERIFIED'}
+    matches=[r for r in rows if r['matched_portfolios']]
+    return {'status':'PUBLIC_ROWS_PARSED','checked_at':now(),'source_url':ESNAD_PUBLIC_URL,
+      'notice':'Experimental public-page extraction. Only rows returned by this page request were checked; not a complete all-pages search. Titles can be truncated. MBS eligibility and tender documents are NOT verified.',
+      'results':matches,'scanned_count':len(rows),'coverage':'SINGLE_PUBLIC_PAGE_ONLY'}
 
 # V11.4.4: Tender research is separate from CRM lead discovery.
 class TenderSearch(BaseModel):

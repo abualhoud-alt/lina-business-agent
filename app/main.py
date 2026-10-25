@@ -452,24 +452,38 @@ MBS_TENDER_TERMS = {
  'Queue / Identification': ('queue','ticketing','visitor management','id card','identification','biometric','انتظار','طابور','بطاقات','هوية','بصمة'),
 }
 
-def parse_esnad_public_table(markup):
+def parse_esnad_public_table(markup, diagnostics=None):
     from bs4 import BeautifulSoup
     soup=BeautifulSoup(markup,'html.parser')
     records=[]
+    if diagnostics is not None:
+        diagnostics.update({'html_bytes':len(markup.encode('utf-8',errors='replace')), 'html_table_count':len(soup.select('table')), 'html_tr_count':len(soup.select('tr')), 'html_td_count':len(soup.select('td')), 'rows_with_7_columns':0, 'rows_with_serial':0, 'rows_with_core_fields':0, 'rows_with_recognized_dates':0, 'rejected_reason_counts':{'too_few_columns':0,'serial_mismatch':0,'missing_core_fields':0,'date_format_mismatch':0}})
     for tr in soup.select('tr'):
         cols=tr.find_all('td',recursive=False)
-        if len(cols)<7: continue
+        if len(cols)<7:
+            if diagnostics is not None: diagnostics['rejected_reason_counts']['too_few_columns']+=1
+            continue
+        if diagnostics is not None: diagnostics['rows_with_7_columns']+=1
         values=[c.get_text(' ',strip=True) for c in cols]
         # The public table typically starts: serial, reference, title, buyer,
         # procurement category, tender type, dates, fee, guarantee, action.
-        if not re.match(r'^\d+[.]?$',values[0]):continue
+        if not re.match(r'^\d+[.]?$',values[0]):
+            if diagnostics is not None: diagnostics['rejected_reason_counts']['serial_mismatch']+=1
+            continue
+        if diagnostics is not None: diagnostics['rows_with_serial']+=1
         if len(values)<8:continue
         ref,title,buyer=values[1:4]
-        if not ref or not title or not buyer:continue
+        if not ref or not title or not buyer:
+            if diagnostics is not None: diagnostics['rejected_reason_counts']['missing_core_fields']+=1
+            continue
+        if diagnostics is not None: diagnostics['rows_with_core_fields']+=1
         date_cell=' '.join(values[6:8])
         purchase=re.search(r'Sales\s*End\s*Date\s*:\s*(\d{2}[-/]\d{2}[-/]\d{4})',date_cell,re.I)
         closing=re.search(r'Bid\s*Closing\s*Date\s*:\s*(\d{2}[-/]\d{2}[-/]\d{4})',date_cell,re.I)
-        if not (purchase or closing):continue
+        if not (purchase or closing):
+            if diagnostics is not None: diagnostics['rejected_reason_counts']['date_format_mismatch']+=1
+            continue
+        if diagnostics is not None: diagnostics['rows_with_recognized_dates']+=1
         title_words=title.casefold()
         matches=[name for name,terms in MBS_TENDER_TERMS.items() if any(term in title_words for term in terms)]
         tender_type=values[5]
@@ -485,6 +499,7 @@ def parse_esnad_public_table(markup):
 
 @app.get('/tender-hunter/esnad-public')
 def esnad_public_tenders(actor:str=Depends(auth)):
+    diagnostics={'stage':'request_started','source_host':'etendering.tenderboard.gov.om'}
     request=urllib.request.Request(ESNAD_PUBLIC_URL,headers={
       'User-Agent':'Mozilla/5.0 (compatible; MBS-LinaTenderResearch/11.4.6)',
       'Accept':'text/html,application/xhtml+xml','Accept-Language':'en,ar;q=0.8'})
@@ -493,24 +508,29 @@ def esnad_public_tenders(actor:str=Depends(auth)):
             final=urllib.parse.urlsplit(response.geturl())
             if final.scheme!='https' or final.hostname!='etendering.tenderboard.gov.om':
                 raise ValueError('Unexpected redirect outside official ESNAD host')
+            diagnostics.update({'stage':'response_received','http_status':response.status,'final_host':final.hostname,'content_type':response.headers.get('Content-Type','')[:100]})
             body=response.read(3_000_001)
             if len(body)>3_000_000:raise ValueError('ESNAD response too large')
             content_type=response.headers.get('Content-Type','')
             charset=response.headers.get_content_charset() or 'utf-8'
             markup=body.decode(charset,errors='replace')
-        rows=parse_esnad_public_table(markup)
+        diagnostics['stage']='parsing_html'
+        rows=parse_esnad_public_table(markup,diagnostics)
+        diagnostics['stage']='parsed_html'
     except Exception as exc:
+        diagnostics['stage']='request_or_parse_failed'
+        if isinstance(exc,urllib.error.HTTPError): diagnostics['upstream_http_status']=exc.code
         return {'status':'UNAVAILABLE','checked_at':now(),'source_url':ESNAD_PUBLIC_URL,
          'notice':'Live ESNAD table could not be read. No tender information was invented. Please use the official portal.',
-         'error_type':type(exc).__name__,'results':[],'scanned_count':0,'coverage':'NOT_VERIFIED'}
+         'error_type':type(exc).__name__,'diagnostics':diagnostics,'results':[],'scanned_count':0,'coverage':'NOT_VERIFIED'}
     if not rows:
         return {'status':'UNVERIFIED_FORMAT','checked_at':now(),'source_url':ESNAD_PUBLIC_URL,
          'notice':'The ESNAD page was reached, but no recognizable tender rows were found. The portal layout or access method may have changed.',
-         'results':[],'scanned_count':0,'coverage':'NOT_VERIFIED'}
+         'results':[],'scanned_count':0,'coverage':'NOT_VERIFIED','diagnostics':diagnostics}
     matches=[r for r in rows if r['matched_portfolios']]
     return {'status':'PUBLIC_ROWS_PARSED','checked_at':now(),'source_url':ESNAD_PUBLIC_URL,
       'notice':'Experimental public-page extraction. Only rows returned by this page request were checked; not a complete all-pages search. Titles can be truncated. MBS eligibility and tender documents are NOT verified.',
-      'results':matches,'scanned_count':len(rows),'coverage':'SINGLE_PUBLIC_PAGE_ONLY'}
+      'results':matches,'scanned_count':len(rows),'coverage':'SINGLE_PUBLIC_PAGE_ONLY','diagnostics':diagnostics}
 
 # V11.4.4: Tender research is separate from CRM lead discovery.
 class TenderSearch(BaseModel):

@@ -19,7 +19,7 @@ BRAVE_SEARCH_API_KEY = os.getenv('BRAVE_SEARCH_API_KEY', '').strip()
 AUTH_DISABLED = os.getenv('LINA_AUTH_DISABLED', 'false').lower() == 'true'
 ALLOWED_ORIGINS = [x.strip() for x in os.getenv('LINA_ALLOWED_ORIGINS', '*').split(',') if x.strip()]
 
-app = FastAPI(title=APP_NAME, version='11.4.3')
+app = FastAPI(title=APP_NAME, version='11.4.5')
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=['GET','POST','PUT','PATCH','DELETE'], allow_headers=['*'], allow_credentials=False)
 
 @app.middleware('http')
@@ -460,9 +460,19 @@ def tender_hunter_search(x:TenderSearch, actor:str=Depends(auth)):
         raise HTTPException(400,'Sector must be Government or Private.')
     count=max(1,min(x.count,20))
     terms=' '.join(x.keywords.split()[:12])[:140]
-    kind=('government ministry public procurement' if sector=='government' else 'private company corporate RFQ procurement')
-    queries=[f'{country} {kind} tender notice {terms}',f'{country} {kind} request for quotation tender {terms}']
+    # ESNAD-first public discovery. This uses indexed public pages only; no supplier login.
+    esnad = 'https://etendering.tenderboard.gov.om/product/publicDash?CTRL_STRDIRECTION=LTR'
+    if sector=='government' and country.casefold()=='oman':
+        queries=[
+            f'site:etendering.tenderboard.gov.om {terms} tender',
+            f'site:tenderboard.gov.om {terms} tender notice',
+            f'Oman ESNAD tender number closing date {terms}',
+        ]
+    else:
+        kind=('government public procurement' if sector=='government' else 'private company corporate RFQ procurement')
+        queries=[f'{country} {kind} tender notice {terms}',f'{country} {kind} request for quotation {terms}']
     found=[];seen=set();errors=[]
+    official_hosts=('etendering.tenderboard.gov.om','tenderboard.gov.om')
     for query in queries:
         try: hits=brave_search(query,min(20,max(8,count)))
         except HTTPException as exc:
@@ -471,19 +481,31 @@ def tender_hunter_search(x:TenderSearch, actor:str=Depends(auth)):
             url=hit.get('url','')
             parsed=urllib.parse.urlsplit(url)
             if parsed.scheme!='https' or not parsed.hostname:continue
-            key=(parsed.hostname.lower(),parsed.path.rstrip('/').lower())
+            key=(parsed.hostname.lower(),parsed.path.rstrip('/').lower(),parsed.query)
             if key in seen:continue
             seen.add(key)
             row={'title':clean_search_text(hit.get('title','')),'description':clean_search_text(hit.get('description','')),'url':url}
             row.update(classify_result(row))
-            # Search snippets are never a verified tender, regardless of keyword matches.
+            host=parsed.hostname.lower()
+            official=host in official_hosts or host.endswith('.tenderboard.gov.om')
+            blob=(row['title']+' '+row['description']).lower()
+            has_ref=bool(re.search(r'\b(?:tender|bid|rfq|reference)\s*(?:no\.?|number|id|ref\.?|#)\s*[:#-]?\s*[a-z0-9][a-z0-9/\-]{3,}',blob,re.I))
+            has_notice=has_ref or bool(re.search(r'\b(?:invitation to tender|bid submission|tender closing|tender notice)\b',blob,re.I))
+            general=any(z in blob for z in ('first electronic interface','about us','how to register','registration guide','news article','tender statistics'))
+            row['source_type']='OFFICIAL_ESNAD' if official else 'THIRD_PARTY_OR_OTHER'
+            row['research_kind']='POSSIBLE_TENDER_NOTICE' if has_notice and not general else ('OFFICIAL_PORTAL_OR_PAGE' if official else 'GENERAL_SOURCE')
+            row['eligibility_status']='NOT_VERIFIED_MBS_LOGIN_REQUIRED' if sector=='government' and country.casefold()=='oman' else 'NOT_VERIFIED'
+            row['tender_reference']='NOT_VERIFIED'
+            row['purchase_deadline']='NOT_VERIFIED'
+            row['closing_deadline']='NOT_VERIFIED'
             row['verified']=False
-            row['research_kind']='POSSIBLE_NOTICE' if row['category']=='POSSIBLE_TENDER_NOTICE' else 'PORTAL_OR_GENERAL_SOURCE'
-            row['next_action']='Open official source and check reference, scope, deadline and registered-supplier access.'
+            row['next_action']='Open the original tender listing and verify reference, purchase deadline and closing date. Check eligibility in MBS supplier login; documents require purchase.' if official else 'Cross-check any claimed tender against the original issuing authority. This source does not establish an active tender.'
             found.append(row)
     if not found and errors:raise HTTPException(502,'; '.join(errors))
-    found.sort(key=lambda r:(r['research_kind']!='POSSIBLE_NOTICE',-r['lead_score']))
-    return {'results':found[:count],'count':min(count,len(found)), 'notice':'Research only. Search results do not verify a tender or deadline. Registration and payment may be required; never purchase or submit automatically.'}
+    found.sort(key=lambda r:(r['research_kind']!='POSSIBLE_TENDER_NOTICE',r['source_type']!='OFFICIAL_ESNAD',-r['lead_score']))
+    return {'results':found[:count], 'count':min(count,len(found)),
+      'official_esnad_url':esnad if sector=='government' and country.casefold()=='oman' else None,
+      'notice':'Public search-index research only. No specific tender reference, purchase date, closing date, or MBS eligibility has been verified. Search engines may not index live ESNAD listings. Open the official portal for current tenders; never purchase or submit automatically.'}
 
 @app.get('/lead-hunter/portfolio')
 def lead_portfolio(_:str=Depends(auth)):

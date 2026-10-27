@@ -3,7 +3,9 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+# Install Chromium and required Linux dependencies
+RUN python -m playwright install --with-deps chromium
 COPY app ./app
 RUN mkdir -p /app/data
 EXPOSE 10000
-CMD ["sh","-c","uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-10000}"]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-10000}"]

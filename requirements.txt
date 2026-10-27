@@ -4,3 +4,4 @@ pydantic==2.11.7
 python-multipart==0.0.20
 psycopg[binary]==3.2.10
 beautifulsoup4==4.12.3
+playwright==1.58.0

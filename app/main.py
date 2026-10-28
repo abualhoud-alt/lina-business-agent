@@ -496,7 +496,83 @@ def parse_esnad_public_table(markup, diagnostics=None):
           'matched_portfolios':matches,'eligibility':'NOT_VERIFIED',
           'source_url':ESNAD_PUBLIC_URL,'source_type':'OFFICIAL_ESNAD_PUBLIC_TABLE'})
     return records
+def scan_esnad_public_pages(max_pages=3):
+    from playwright.sync_api import sync_playwright
 
+    all_records = []
+    seen = set()
+    pages_scanned = 0
+    page_details = []
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page(
+                locale="en-US",
+                viewport={"width": 1365, "height": 900}
+            )
+            page.set_default_timeout(15000)
+
+            page.goto(
+                ESNAD_PUBLIC_URL,
+                wait_until="domcontentloaded",
+                timeout=30000
+            )
+
+            for page_number in range(1, max_pages + 1):
+                page.wait_for_selector("table tr td", timeout=15000)
+
+                records = parse_esnad_public_table(page.content())
+
+                if not records:
+                    page_details.append({
+                        "page": page_number,
+                        "status": "NO_ROWS"
+                    })
+                    break
+
+                new_records = 0
+
+                for record in records:
+                    reference = record["tender_reference"]
+
+                    if reference not in seen:
+                        seen.add(reference)
+                        all_records.append(record)
+                        new_records += 1
+
+                pages_scanned += 1
+
+                page_details.append({
+                    "page": page_number,
+                    "rows": len(records),
+                    "new_records": new_records
+                })
+
+                if page_number == max_pages:
+                    break
+
+                # Use ESNAD's own public pagination control.
+                # Do not manufacture security or form parameters.
+                next_button = page.get_by_text(
+                    "Next",
+                    exact=False
+                ).last
+
+                if next_button.count() == 0:
+                    break
+
+                previous_html = page.content()
+
+                next_button.click(timeout=15000)
+
+                page.wait_for_load_state(
+                    "domcontentloaded",
+                    timeout=30000
+                )
+
+                if page.content() == previous_html:
+                    break
 @app.get('/tender-hunter/esnad-public')
 def esnad_public_tenders(actor:str=Depends(auth)):
     diagnostics={'stage':'request_started','source_host':'etendering.tenderboard.gov.om'}

@@ -5,7 +5,7 @@ from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-
+from playwright.sync_api import sync_playwright
 BASE = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv('LINA_DATA_DIR', str(BASE / 'data')))
 DATA_DIR.mkdir(parents=True, exist_ok=True)

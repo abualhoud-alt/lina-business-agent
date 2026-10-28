@@ -582,6 +582,42 @@ def scan_esnad_public_pages(max_pages=3):
         "pages_scanned": pages_scanned,
         "page_details": page_details
     }
+@app.get("/tender-hunter/esnad-public-multipage")
+def esnad_public_multipage(actor: str = Depends(auth)):
+    try:
+        scan = scan_esnad_public_pages(max_pages=3)
+        records = scan["records"]
+        matches = [r for r in records if r["matched_portfolios"]]
+
+        return {
+            "status": "PUBLIC_ROWS_PARSED" if records else "UNVERIFIED_FORMAT",
+            "checked_at": now(),
+            "source_url": ESNAD_PUBLIC_URL,
+            "notice": (
+                "Experimental three-page ESNAD public scan. "
+                "Supplier eligibility and tender documents are not verified."
+            ),
+            "results": matches,
+            "scanned_count": len(records),
+            "pages_scanned": scan["pages_scanned"],
+            "page_details": scan["page_details"],
+            "coverage": "LIMITED_PUBLIC_PAGES_ONLY"
+        }
+
+    except Exception as exc:
+        return {
+            "status": "UNAVAILABLE",
+            "checked_at": now(),
+            "source_url": ESNAD_PUBLIC_URL,
+            "notice": "Multi-page ESNAD scan failed. No tender data was invented.",
+            "error_type": type(exc).__name__,
+            "error_detail": str(exc)[:300],
+            "results": [],
+            "scanned_count": 0,
+            "pages_scanned": 0,
+            "coverage": "NOT_VERIFIED"
+        }
+
 @app.get('/tender-hunter/esnad-public')
 def esnad_public_tenders(actor:str=Depends(auth)):
     diagnostics={'stage':'request_started','source_host':'etendering.tenderboard.gov.om'}

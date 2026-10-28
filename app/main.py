@@ -554,7 +554,7 @@ def scan_esnad_public_pages(max_pages=3):
 
                 # Use ESNAD's own public pagination control.
                 # Do not manufacture security or form parameters.
-                next_button = page.locator('td[title="Next»"] a').first
+                next_button = page.locator("a[onclick*='ShowPage(2)']").first
 
                 if next_button.count() == 0:
                     page_details.append({

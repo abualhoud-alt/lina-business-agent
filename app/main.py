@@ -573,6 +573,15 @@ def scan_esnad_public_pages(max_pages=3):
 
                 if page.content() == previous_html:
                     break
+            page.close()
+        finally:
+            browser.close()
+
+    return {
+        "records": all_records,
+        "pages_scanned": pages_scanned,
+        "page_details": page_details
+    }
 @app.get('/tender-hunter/esnad-public')
 def esnad_public_tenders(actor:str=Depends(auth)):
     diagnostics={'stage':'request_started','source_host':'etendering.tenderboard.gov.om'}

@@ -554,10 +554,7 @@ def scan_esnad_public_pages(max_pages=3):
 
                 # Use ESNAD's own public pagination control.
                 # Do not manufacture security or form parameters.
-                next_button = page.get_by_text(
-                    "Next",
-                    exact=False
-                ).last
+                next_button = page.locator('td[title="Next»"] a').first
 
                 if next_button.count() == 0:
                     break

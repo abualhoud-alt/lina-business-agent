@@ -556,14 +556,14 @@ def scan_esnad_public_pages(max_pages=3):
                 # Do not manufacture security or form parameters.
                 next_button = page.locator('td[title="Next»"] a').first
 
-               if next_button.count() == 0:
-    page_details.append({
-        "page": page_number,
-        "navigation_error": "NEXT_BUTTON_NOT_FOUND",
-        "matching_links": page.locator("a[onclick*='ShowPage']").count(),
-        "next_cells": page.locator("td[title*='Next']").count()
-    })
-    break
+                if next_button.count() == 0:
+                    page_details.append({
+                        "page": page_number,
+                        "navigation_error": "NEXT_BUTTON_NOT_FOUND",
+                        "matching_links": page.locator("a[onclick*='ShowPage']").count(),
+                        "next_cells": page.locator("td[title*='Next']").count()
+                    })
+                    break
 
                 previous_html = page.content()
 
